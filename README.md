@@ -1,13 +1,131 @@
 # NativeLab
 
+[Português](README.md) | [English](README.en.md)
+
+**Plataforma atual: somente Linux.** O isolamento depende de user, PID, IPC,
+network e UTS namespaces, além de bubblewrap.
+
 > [!CAUTION]
 > **NativeLab é uma prova de conceito experimental, não auditada e
 > potencialmente perigosa. Não a trate como uma fronteira de segurança para
 > malware, instaladores desconhecidos, dependências hostis ou dados valiosos.**
 
-NativeLab mantém uma sessão `bubblewrap` persistente por workspace. Chamadas
-separadas entram nessa sessão por OpenSSH sobre Unix socket e compartilham os
-mesmos namespaces, inclusive o localhost privado:
+## Por que o NativeLab existe
+
+O NativeLab nasceu de um problema prático no uso de agentes de código para
+desenvolvimento e testes.
+
+Um agente pode estar isolado enquanto edita um projeto, mas fluxos reais de
+desenvolvimento frequentemente exigem processos que sobrevivem a um único
+comando:
+
+- servidores de desenvolvimento Vite/Astro;
+- automação de browser com Playwright;
+- aplicações gráficas sob Xvfb;
+- bancos de teste e serviços locais;
+- aplicações nativas que precisam se comunicar por localhost.
+
+Uma solução comum é iniciar esses processos fora da sandbox do agente. Isso
+cria uma diferença de autoridade:
+
+```text
+agente isolado
+    |
+    | modifica arquivos do projeto
+    v
+usuário aprova "npm run dev" fora da sandbox
+    |
+    v
+dev server / hot reload executa código do projeto
+com as permissões normais do usuário no host
+```
+
+Isso é especialmente indesejável quando o conteúdo do projeto pode ser não
+confiável ou influenciado por entrada externa. Uma prompt injection,
+dependência maliciosa, arquivo gerado ou repositório comprometido pode afetar
+código posteriormente executado por uma ação de desenvolvimento aparentemente
+legítima. A aprovação também é uma evidência fraca de intenção: iniciar um
+servidor de desenvolvimento é uma ação normal e esperada durante testes.
+
+O NativeLab move o workload de desenvolvimento para uma sandbox persistente:
+
+```text
+                 sessão NativeLab
+             ┌────────────────────────┐
+Codex ───────►│ dev server             │
+              │ browser / Playwright   │
+              │ Xvfb / aplicação       │
+              │ processos de teste     │
+              │ localhost privado      │
+             └────────────────────────┘
+                        │
+                 sem rede do host
+                 sem HOME real
+                 filesystem restrito
+```
+
+Processos na mesma sessão se comunicam normalmente, inclusive por localhost,
+mas permanecem isolados do host e da Internet. A propriedade pretendida é,
+aproximadamente:
+
+```text
+Authority(workload) <= Authority(NativeLab session)
+```
+
+Executar outro processo de teste não deve conceder implicitamente mais
+autoridade no host. Operações que realmente ampliam autoridade — como expor
+outro diretório do host ou habilitar rede externa — pertencem à policy
+confiável do NativeLab, não à configuração controlada pelo projeto.
+
+Essa motivação orienta as principais decisões do projeto:
+
+| Decisão | Propriedade pretendida |
+| --- | --- |
+| configuração somente no host | o projeto não pode conceder poderes a si mesmo |
+| workspace atual RW | o desenvolvimento continua funcional |
+| outros projetos trusted RO | referências e dependências sem modificação |
+| HOME real ausente | browser e aplicações não herdam credenciais pessoais |
+| `/run` privado | sockets e agentes da sessão desktop não são expostos |
+| localhost privado | Vite e Playwright se comunicam sem alcançar o host |
+| Internet ausente | o processo testado não recebe egress implícito |
+
+### Modelo de ameaça
+
+O objetivo principal é evitar escalada acidental de capabilities e
+*capability laundering* em fluxos de desenvolvimento conduzidos por agentes.
+O NativeLab não pretende ser uma fronteira de máquina virtual endurecida para
+executar malware arbitrário.
+
+O design prefere deliberadamente:
+
+```text
+"este programa não funciona dentro da sandbox"
+```
+
+em vez de:
+
+```text
+"execute fora da sandbox para o teste funcionar"
+```
+
+Esse segundo fallback é exatamente o que o NativeLab foi criado para evitar.
+
+### Fluxo de exemplo
+
+```text
+Codex
+  ├─ native-lab run -- bash -c 'cd web && npm run dev'
+  │      └─ Astro/Vite :4321
+  │
+  └─ Playwright MCP
+         └─ native-lab run playwright-mcp
+                └─ Chromium
+                     └─ http://localhost:4321
+```
+
+Os dois comandos entram na mesma sessão `bubblewrap` do workspace e, portanto,
+compartilham os mesmos namespaces e o localhost privado. A entrada ocorre por
+OpenSSH sobre Unix socket:
 
 ```text
 native-lab run npm run dev
@@ -321,6 +439,111 @@ serializado e `execve(2)`.
 
 TTY, aplicações full-screen e prompts de senha estão fora desta etapa.
 
+### A fronteira é o `native-lab`, não a linha do shell
+
+O launcher `native-lab` é parte do TCB e precisa ser iniciado no host. Depois
+de validar/criar a sessão, ele envia ao processo SSH apenas os argumentos
+recebidos após `native-lab run`. Isso não faz com que o restante de uma linha
+composta seja automaticamente executado dentro da sandbox.
+
+> [!WARNING]
+> Metacaracteres não protegidos são interpretados pelo shell do host antes de
+> o NativeLab receber os argumentos. Portanto, este comando é perigoso:
+>
+> ```bash
+> native-lab run npm test && npm run build
+> ```
+>
+> Somente `npm test` passa pelo NativeLab; se ele terminar com sucesso,
+> `npm run build` é iniciado diretamente pelo shell do host.
+
+Para executar a operação composta inteira dentro da sessão, passe o programa
+do shell e seu script como argumentos do `native-lab run`:
+
+```bash
+native-lab run -- sh -c 'npm test && npm run build'
+```
+
+O mesmo cuidado vale para `||`, `;`, pipes, redirecionamentos, substituições de
+comando e globs. Nos exemplos abaixo, `consumer`, o redirecionamento, `probe` e
+a expansão de `*.js` pertencem ao shell externo, não ao NativeLab:
+
+```bash
+native-lab run producer | consumer
+native-lab run command > /tmp/result.log
+native-lab run echo "$(probe)"
+native-lab run tool *.js
+```
+
+Prefira argv direto para um único processo. Quando precisar de sintaxe de
+shell, coloque toda a expressão em uma string protegida passada a `sh -c` ou
+`bash -c`. A aprovação no host deve cobrir o launcher confiável do NativeLab,
+sem comandos adjacentes fora dele.
+
+### Configurar o Playwright MCP no Codex
+
+O servidor Playwright MCP pode ser iniciado diretamente dentro da sessão do
+workspace. Adicione ao `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.native_lab_playwright]
+command = "native-lab"
+args = [
+    "run",
+    "playwright-mcp",
+    "--isolated",
+    "--output-dir", ".playwright-mcp",
+    "--viewport-size", "1920x1080",
+    "--allowed-hosts", "127.0.0.1,localhost",
+]
+startup_timeout_sec = 20.0
+tool_timeout_sec = 60.0
+env_vars = ["XDG_RUNTIME_DIR"]
+default_tools_approval_mode = "prompt"
+```
+
+O `native-lab run` faz o servidor MCP entrar na sessão associada ao diretório
+de trabalho do Codex. `XDG_RUNTIME_DIR` precisa ser encaminhado para que o
+cliente encontre o runtime e o Unix socket do NativeLab. O Chromium do MCP e
+um servidor iniciado separadamente com `native-lab run npm run dev`, por
+exemplo, compartilham então o mesmo localhost privado.
+
+Essa configuração pressupõe que `native-lab` e `playwright-mcp` estejam no
+PATH recebido pelo processo e que seus arquivos necessários estejam visíveis
+na sandbox.
+
+Se for necessário usar uma instalação do Google Chrome em
+`/opt/google/chrome`, exponha-a read-only no config confiável do NativeLab,
+`$HOME/.config/native-lab/config.toml`:
+
+```toml
+[filesystem]
+extra_read_only = [
+    "/opt/google/chrome",
+]
+```
+
+Alterar esse arquivo muda o policy digest e cria uma sessão com a nova policy;
+uma sessão antiga já em execução não recebe o mount retroativamente.
+
+### Orientar o agente enquanto não há execução MCP genérica
+
+Hoje, o MCP acima oferece as ferramentas do Playwright, mas não é um protocolo
+genérico para executar qualquer comando dentro da sessão. Até essa interface
+existir, instrua o agente a prefixar processos de desenvolvimento e teste com
+`native-lab run`. Um exemplo de orientação para `AGENTS.md` ou para o prompt:
+
+```text
+Execute código do projeto, servidores e testes dentro do NativeLab. Para um
+processo simples, use argv direto: `native-lab run <programa> <argumentos>`.
+Para expressões compostas, coloque toda a expressão dentro da sessão, por
+exemplo: `native-lab run -- sh -c '<comando 1> && <comando 2>'`. Nunca deixe
+`&&`, `||`, `;`, pipes, redirecionamentos, substituições de comando ou globs
+para o shell externo. Processos iniciados no mesmo workspace compartilham
+localhost. Se algo não funcionar na sandbox, não o execute diretamente no
+host como fallback; relate a limitação.
+```
+
 ## Runtime e lifecycle
 
 ```text
@@ -416,3 +639,12 @@ MCP, Xvfb integrado, acesso ao display do host, Docker, pidfd, seccomp próprio
 ou profiles de capabilities. Antes de qualquer uso como ferramenta de
 segurança são necessários threat model formal, revisão especializada, testes
 adversariais e hardening adicional.
+
+## Roadmap
+
+- oferecer um servidor/protocolo MCP para o agente solicitar a execução de
+  comandos arbitrários dentro da sessão NativeLab por argv estruturado, sem
+  depender de instruções textuais para chamar `native-lab run` nem da
+  interpretação do shell do host;
+- manter qualquer ampliação de filesystem, rede ou capabilities sob controle
+  da policy confiável do host.
