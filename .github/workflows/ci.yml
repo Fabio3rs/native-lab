@@ -1,0 +1,99 @@
+name: CI
+
+'on':
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Shell and sandbox smoke tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            bubblewrap \
+            coreutils \
+            curl \
+            openssh-client \
+            openssh-server \
+            python3 \
+            shellcheck \
+            socat \
+            util-linux
+
+      - name: Enable unprivileged user namespaces on the ephemeral runner
+        run: |
+          if [[ -e /proc/sys/kernel/unprivileged_userns_clone ]]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+
+          # Ubuntu 24.04 can restrict unprivileged user namespaces through
+          # AppArmor. GitHub-hosted jobs run in disposable VMs, so relax that
+          # outer restriction only for this test VM. native-lab still creates
+          # its own user namespace and drops every effective capability.
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - name: Show sandbox environment
+        run: |
+          uname -a
+          bwrap --version
+          ssh -V
+          sysctl kernel.unprivileged_userns_clone 2>/dev/null || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true
+
+      - name: Check executable modes
+        run: |
+          test -x native-lab
+          test -x native-labd
+          test -x native-lab-session
+          test -x native-lab-smoke.sh
+
+      - name: Check Bash syntax
+        run: |
+          bash -n \
+            native-lab \
+            native-labd \
+            native-lab-session \
+            native-lab-smoke.sh
+
+      - name: Run ShellCheck
+        run: |
+          shellcheck \
+            native-lab \
+            native-labd \
+            native-lab-session \
+            native-lab-smoke.sh
+
+      - name: Reject committed runtime and private keys
+        run: |
+          if git ls-files -- run | grep -q .; then
+            echo 'run/ contains runtime state and must not be committed.' >&2
+            exit 1
+          fi
+
+          if git grep -l 'BEGIN OPENSSH PRIVATE KEY' -- ':!*.md'; then
+            echo 'An OpenSSH private key was committed.' >&2
+            exit 1
+          fi
+
+      - name: Run native-lab smoke test
+        run: timeout 120 ./native-lab-smoke.sh

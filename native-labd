@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+umask 077
+
+die() {
+    printf 'native-labd: %s\n' "$*" >&2
+    exit 1
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
+}
+
+write_atomic() {
+    local destination=$1 temporary
+    temporary="$destination.tmp.$$"
+    cat >"$temporary"
+    chmod 600 "$temporary"
+    mv -f -- "$temporary" "$destination"
+}
+
+WORKSPACE=
+SESSION_DIR=
+SESSION_ID=
+PROFILE=
+POLICY_VERSION=
+
+while (($#)); do
+    case "$1" in
+        --workspace) WORKSPACE=${2-}; shift 2 ;;
+        --session-dir) SESSION_DIR=${2-}; shift 2 ;;
+        --session-id) SESSION_ID=${2-}; shift 2 ;;
+        --profile) PROFILE=${2-}; shift 2 ;;
+        --policy-version) POLICY_VERSION=${2-}; shift 2 ;;
+        *) die "unknown or incomplete argument: $1" ;;
+    esac
+done
+
+[[ -n "$WORKSPACE" && -n "$SESSION_DIR" && -n "$SESSION_ID" &&
+   -n "$PROFILE" && -n "$POLICY_VERSION" ]] || die 'incomplete configuration'
+[[ "$WORKSPACE" == /* && "$SESSION_DIR" == /* ]] || die 'paths must be absolute'
+[[ -d "$WORKSPACE" && ! -L "$SESSION_DIR" ]] || die 'invalid workspace or session directory'
+[[ "${PATH:-}" != *$'\n'* && "${PATH:-}" != *$'\r'* ]] || die 'PATH contains unsupported newlines'
+
+need bwrap
+need date
+need realpath
+
+SCRIPT_DIR=$(dirname -- "$(realpath -- "$0")")
+SESSION_SCRIPT="$SCRIPT_DIR/native-lab-session"
+[[ -x "$SESSION_SCRIPT" ]] || die "missing executable: $SESSION_SCRIPT"
+
+CONTROL_DIR="$SESSION_DIR/control"
+PID_FILE="$SESSION_DIR/holder.pid"
+INFO_FILE="$SESSION_DIR/session.info"
+[[ -d "$CONTROL_DIR" && ! -L "$CONTROL_DIR" ]] || die "invalid control directory: $CONTROL_DIR"
+
+START_TICKS=$(awk '{print $22}' "/proc/$$/stat")
+{
+    printf 'pid=%s\n' "$$"
+    printf 'start_ticks=%s\n' "$START_TICKS"
+    printf 'session_id=%s\n' "$SESSION_ID"
+} | write_atomic "$PID_FILE"
+
+{
+    printf 'workspace=%s\n' "$WORKSPACE"
+    printf 'profile=%s\n' "$PROFILE"
+    printf 'policy_version=%s\n' "$POLICY_VERSION"
+    printf 'created=%s\n' "$(date --iso-8601=seconds)"
+    printf 'holder_pid=%s\n' "$$"
+} | write_atomic "$INFO_FILE"
+
+PATH_VALUE=${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}
+HOME_VALUE=${HOME:-$WORKSPACE}
+USER_VALUE=${USER:-$(id -un)}
+LOGNAME_VALUE=${LOGNAME:-$USER_VALUE}
+SHELL_VALUE=${SHELL:-/bin/sh}
+LANG_VALUE=${LANG:-C.UTF-8}
+
+BWRAP_PID=
+shutdown() {
+    local status=$?
+    trap - EXIT INT TERM HUP
+    if [[ -n "$BWRAP_PID" ]]; then
+        kill -TERM "$BWRAP_PID" 2>/dev/null || true
+        wait "$BWRAP_PID" 2>/dev/null || true
+    fi
+    exit "$status"
+}
+trap shutdown EXIT INT TERM HUP
+
+bwrap \
+    --unshare-user \
+    --unshare-pid \
+    --unshare-ipc \
+    --unshare-net \
+    --unshare-uts \
+    --hostname native-lab \
+    --new-session \
+    --die-with-parent \
+    --cap-drop ALL \
+    --ro-bind / / \
+    --bind "$WORKSPACE" "$WORKSPACE" \
+    --tmpfs /tmp \
+    --tmpfs /run \
+    --dir /run/native-lab-control \
+    --bind "$CONTROL_DIR" /run/native-lab-control \
+    --proc /proc \
+    --dev /dev \
+    --chdir "$WORKSPACE" \
+    --clearenv \
+    --setenv PATH "$PATH_VALUE" \
+    --setenv HOME "$HOME_VALUE" \
+    --setenv USER "$USER_VALUE" \
+    --setenv LOGNAME "$LOGNAME_VALUE" \
+    --setenv SHELL "$SHELL_VALUE" \
+    --setenv LANG "$LANG_VALUE" \
+    --setenv TMPDIR /tmp \
+    --setenv NATIVE_LAB_WORKSPACE "$WORKSPACE" \
+    --setenv NATIVE_LAB_SESSION_ID "$SESSION_ID" \
+    -- "$SESSION_SCRIPT" &
+BWRAP_PID=$!
+
+set +e
+wait "$BWRAP_PID"
+BWRAP_STATUS=$?
+set -e
+exit "$BWRAP_STATUS"

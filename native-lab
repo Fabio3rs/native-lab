@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+umask 077
+
+readonly PROFILE="default"
+readonly POLICY_VERSION="1"
+readonly STARTUP_TIMEOUT_SECONDS="5"
+readonly STOP_GRACE_SECONDS="2"
+
+die() {
+    printf 'native-lab: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  native-lab run [--] COMMAND [ARGS...]
+  native-lab status
+  native-lab stop
+EOF
+    exit 2
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
+}
+
+private_dir_ok() {
+    local path=$1 owner mode
+    [[ -d "$path" && ! -L "$path" ]] || return 1
+    owner=$(stat -Lc '%u' -- "$path") || return 1
+    mode=$(stat -Lc '%a' -- "$path") || return 1
+    [[ "$owner" == "$(id -u)" && "$mode" == "700" ]]
+}
+
+validate_runtime_dir() {
+    [[ -n "${XDG_RUNTIME_DIR:-}" ]] || die 'XDG_RUNTIME_DIR is not set'
+    [[ "$XDG_RUNTIME_DIR" == /* ]] || die 'XDG_RUNTIME_DIR must be an absolute path'
+    private_dir_ok "$XDG_RUNTIME_DIR" ||
+        die 'XDG_RUNTIME_DIR must be a non-symlink directory owned by the current user with mode 0700'
+    [[ -w "$XDG_RUNTIME_DIR" && -x "$XDG_RUNTIME_DIR" ]] ||
+        die 'XDG_RUNTIME_DIR is not writable/searchable'
+}
+
+ensure_private_dir() {
+    local path=$1
+    if [[ ! -e "$path" ]]; then
+        mkdir -m 700 -- "$path" 2>/dev/null || true
+    fi
+    private_dir_ok "$path" || die "unsafe runtime directory: $path"
+}
+
+resolve_workspace() {
+    WORKSPACE=$(realpath -- "$PWD") || die "cannot resolve workspace: $PWD"
+    [[ -d "$WORKSPACE" ]] || die "workspace is not a directory: $WORKSPACE"
+    [[ "$WORKSPACE" != *$'\n'* && "$WORKSPACE" != *$'\r'* ]] ||
+        die 'workspace paths containing newlines are not supported by this PoC'
+    case "$WORKSPACE" in
+        /|/run|/run/*|/tmp|/tmp/*|/proc|/proc/*|/dev|/dev/*)
+            die "workspace conflicts with a private sandbox mount: $WORKSPACE"
+            ;;
+    esac
+}
+
+compute_session_id() {
+    local digest
+    digest=$(printf '%s\0%s\0%s' "$WORKSPACE" "$PROFILE" "$POLICY_VERSION" | sha256sum)
+    digest=${digest%% *}
+    SESSION_ID=${digest:0:24}
+}
+
+setup_session_paths() {
+    RUNTIME_ROOT="$XDG_RUNTIME_DIR/native-lab"
+    SESSION_DIR="$RUNTIME_ROOT/$SESSION_ID"
+    CONTROL_DIR="$SESSION_DIR/control"
+    SOCK="$CONTROL_DIR/lab-ssh.sock"
+    LOCK="$SESSION_DIR/start.lock"
+    PID_FILE="$SESSION_DIR/holder.pid"
+    INFO_FILE="$SESSION_DIR/session.info"
+    LOG_FILE="$SESSION_DIR/daemon.log"
+}
+
+ensure_session_dirs() {
+    local LC_ALL=C
+    ensure_private_dir "$RUNTIME_ROOT"
+    ensure_private_dir "$SESSION_DIR"
+    if (( ${#SOCK} > 107 )); then
+        die "Unix socket path exceeds Linux's 107-byte limit: $SOCK"
+    fi
+}
+
+session_metadata_matches() {
+    local saved_workspace saved_profile saved_policy
+    [[ -s "$INFO_FILE" ]] || return 1
+    saved_workspace=$(read_info_value "$INFO_FILE" workspace 2>/dev/null) || return 1
+    saved_profile=$(read_info_value "$INFO_FILE" profile 2>/dev/null) || return 1
+    saved_policy=$(read_info_value "$INFO_FILE" policy_version 2>/dev/null) || return 1
+    [[ "$saved_workspace" == "$WORKSPACE" && "$saved_profile" == "$PROFILE" &&
+       "$saved_policy" == "$POLICY_VERSION" ]]
+}
+
+reject_metadata_collision() {
+    if [[ -e "$INFO_FILE" ]] && ! session_metadata_matches; then
+        die "session metadata does not match its hash directory: $SESSION_DIR"
+    fi
+}
+
+read_info_value() {
+    local file=$1 key=$2 line
+    [[ -r "$file" ]] || return 1
+    while IFS= read -r line; do
+        if [[ "$line" == "$key="* ]]; then
+            printf '%s\n' "${line#*=}"
+            return 0
+        fi
+    done <"$file"
+    return 1
+}
+
+posix_quote() {
+    local value=$1
+    value=${value//\'/\'\\\'\'}
+    printf "'%s'" "$value"
+}
+
+build_ssh_args() {
+    local proxy
+    # OpenSSH already prefixes ProxyCommand with "exec" when it invokes the
+    # user's shell. Supplying another one would try to execute a program named
+    # "exec" ("exec exec socat ...").
+    proxy="socat STDIO $(posix_quote "UNIX-CONNECT:$SOCK")"
+    SSH_ARGS=(
+        -T
+        -o BatchMode=yes
+        -o ConnectTimeout=1
+        -o ConnectionAttempts=1
+        -o ServerAliveInterval=2
+        -o ServerAliveCountMax=1
+        -o "ProxyCommand=$proxy"
+        -o HostKeyAlias=native-lab
+        -o "UserKnownHostsFile=$CONTROL_DIR/known_hosts"
+        -o StrictHostKeyChecking=yes
+        -o IdentitiesOnly=yes
+        -o PasswordAuthentication=no
+        -o KbdInteractiveAuthentication=no
+        -o LogLevel=ERROR
+        -i "$CONTROL_DIR/client_ed25519"
+    )
+}
+
+session_alive() {
+    local login_user
+    [[ -S "$SOCK" && -s "$CONTROL_DIR/client_ed25519" &&
+       -s "$CONTROL_DIR/known_hosts" && -s "$CONTROL_DIR/user" ]] || return 1
+    IFS= read -r login_user <"$CONTROL_DIR/user" || return 1
+    [[ -n "$login_user" ]] || return 1
+    build_ssh_args
+    ssh "${SSH_ARGS[@]}" "$login_user@native-lab" true </dev/null >/dev/null 2>&1
+}
+
+cmdline_has_exact_arg() {
+    local pid=$1 wanted=$2 arg
+    [[ -r "/proc/$pid/cmdline" ]] || return 1
+    while IFS= read -r -d '' arg; do
+        [[ "$arg" == "$wanted" ]] && return 0
+    done <"/proc/$pid/cmdline"
+    return 1
+}
+
+read_holder_identity() {
+    HOLDER_PID=$(read_info_value "$PID_FILE" pid 2>/dev/null || true)
+    HOLDER_START=$(read_info_value "$PID_FILE" start_ticks 2>/dev/null || true)
+    HOLDER_SESSION=$(read_info_value "$PID_FILE" session_id 2>/dev/null || true)
+    [[ "$HOLDER_PID" =~ ^[0-9]+$ && "$HOLDER_START" =~ ^[0-9]+$ &&
+       "$HOLDER_SESSION" == "$SESSION_ID" ]]
+}
+
+holder_matches() {
+    local actual_start
+    read_holder_identity || return 1
+    [[ -r "/proc/$HOLDER_PID/stat" ]] || return 1
+    actual_start=$(awk '{print $22}' "/proc/$HOLDER_PID/stat" 2>/dev/null) || return 1
+    [[ "$actual_start" == "$HOLDER_START" ]] || return 1
+    cmdline_has_exact_arg "$HOLDER_PID" "$DAEMON" || return 1
+    cmdline_has_exact_arg "$HOLDER_PID" "$SESSION_DIR" || return 1
+    cmdline_has_exact_arg "$HOLDER_PID" "$WORKSPACE" || return 1
+}
+
+terminate_holder() {
+    local deadline
+    holder_matches || return 1
+    kill -TERM "$HOLDER_PID" 2>/dev/null || true
+    deadline=$((SECONDS + STOP_GRACE_SECONDS))
+    while holder_matches && (( SECONDS < deadline )); do
+        sleep 0.1
+    done
+    if holder_matches; then
+        kill -KILL "$HOLDER_PID" 2>/dev/null || true
+    fi
+    while holder_matches; do
+        sleep 0.05
+    done
+}
+
+cleanup_stale_state() {
+    rm -rf -- "$CONTROL_DIR"
+    rm -f -- "$PID_FILE" "$INFO_FILE"
+}
+
+acquire_lock() {
+    exec {LOCK_FD}>"$LOCK"
+    flock -x "$LOCK_FD"
+}
+
+release_lock() {
+    flock -u "$LOCK_FD" 2>/dev/null || true
+    exec {LOCK_FD}>&-
+}
+
+start_session() {
+    [[ -x "$DAEMON" ]] || die "missing executable: $DAEMON"
+
+    cleanup_stale_state
+    mkdir -m 700 -- "$CONTROL_DIR"
+    : >"$LOG_FILE"
+
+    (
+        # A client killed during startup must not leave the lock held by the
+        # long-lived daemon through an inherited descriptor.
+        exec {LOCK_FD}>&-
+        exec nohup "$DAEMON" \
+            --workspace "$WORKSPACE" \
+            --session-dir "$SESSION_DIR" \
+            --session-id "$SESSION_ID" \
+            --profile "$PROFILE" \
+            --policy-version "$POLICY_VERSION" \
+            >>"$LOG_FILE" 2>&1 </dev/null
+    ) &
+}
+
+wait_session_ready() {
+    local deadline=$((SECONDS + STARTUP_TIMEOUT_SECONDS))
+    while (( SECONDS < deadline )); do
+        session_alive && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+ensure_session() {
+    reject_metadata_collision
+    session_alive && return 0
+    acquire_lock
+    reject_metadata_collision
+    if session_alive; then
+        release_lock
+        return 0
+    fi
+
+    if holder_matches; then
+        terminate_holder || true
+    fi
+    start_session
+    if ! wait_session_ready; then
+        holder_matches && terminate_holder || true
+        cleanup_stale_state
+        release_lock
+        printf 'native-lab: session failed to become ready\n' >&2
+        if [[ -s "$LOG_FILE" ]]; then
+            printf '%s\n' '--- daemon.log ---' >&2
+            sed -n '1,200p' "$LOG_FILE" >&2
+        fi
+        exit 1
+    fi
+    release_lock
+}
+
+encode_remote_command() {
+    local arg
+    REMOTE_COMMAND="cd $(posix_quote "$WORKSPACE") && PATH=$(posix_quote "${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}") exec"
+    for arg in "$@"; do
+        REMOTE_COMMAND+=" $(posix_quote "$arg")"
+    done
+}
+
+run_command() {
+    (($# > 0)) || usage
+    if [[ "$1" == "--" ]]; then
+        shift
+        (($# > 0)) || usage
+    fi
+    need ssh
+    need socat
+    ensure_session_dirs
+    ensure_session
+    encode_remote_command "$@"
+
+    local login_user
+    IFS= read -r login_user <"$CONTROL_DIR/user"
+    build_ssh_args
+    exec ssh "${SSH_ARGS[@]}" "$login_user@native-lab" "$REMOTE_COMMAND"
+}
+
+status_command() {
+    local state=stopped holder='-' created='-'
+    if [[ -d "$SESSION_DIR" ]]; then
+        private_dir_ok "$SESSION_DIR" || die "unsafe session directory: $SESSION_DIR"
+        reject_metadata_collision
+        holder=$(read_info_value "$PID_FILE" pid 2>/dev/null || printf '%s' '-')
+        created=$(read_info_value "$INFO_FILE" created 2>/dev/null || printf '%s' '-')
+        if session_alive; then
+            state=alive
+        elif [[ -e "$PID_FILE" || -e "$SOCK" || -e "$INFO_FILE" ]]; then
+            state=stale
+        fi
+    fi
+
+    printf 'Workspace:       %s\n' "$WORKSPACE"
+    printf 'Session:         %s\n' "$SESSION_ID"
+    printf 'Profile:         %s\n' "$PROFILE"
+    printf 'Policy:          %s\n' "$POLICY_VERSION"
+    printf 'Runtime:         %s\n' "$SESSION_DIR"
+    printf 'SSH socket:      %s\n' "$state"
+    printf 'Holder PID:      %s\n' "$holder"
+    printf 'Created:         %s\n' "$created"
+    [[ "$state" == alive ]]
+}
+
+stop_command() {
+    if [[ ! -d "$SESSION_DIR" ]]; then
+        printf 'native-lab: session already stopped (%s)\n' "$SESSION_ID"
+        return 0
+    fi
+    private_dir_ok "$SESSION_DIR" || die "unsafe session directory: $SESSION_DIR"
+    acquire_lock
+    reject_metadata_collision
+
+    if session_alive && ! holder_matches; then
+        release_lock
+        die 'session is operational but holder identity is invalid; refusing to signal a process'
+    fi
+    if holder_matches; then
+        terminate_holder || {
+            release_lock
+            die 'holder could not be terminated safely'
+        }
+    fi
+    cleanup_stale_state
+    release_lock
+    printf 'native-lab: stopped session %s\n' "$SESSION_ID"
+}
+
+main() {
+    (($# > 0)) || usage
+    need realpath
+    need sha256sum
+    need stat
+    need flock
+    need awk
+    validate_runtime_dir
+    resolve_workspace
+    compute_session_id
+    setup_session_paths
+    SCRIPT_DIR=$(dirname -- "$(realpath -- "$0")")
+    DAEMON="$SCRIPT_DIR/native-labd"
+
+    case "$1" in
+        run)
+            shift
+            run_command "$@"
+            ;;
+        status)
+            (($# == 1)) || usage
+            status_command
+            ;;
+        stop)
+            (($# == 1)) || usage
+            stop_command
+            ;;
+        *) usage ;;
+    esac
+}
+
+main "$@"

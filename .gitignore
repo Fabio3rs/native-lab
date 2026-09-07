@@ -1,0 +1,5 @@
+# Runtime local dos spikes antigos. Contém sockets, logs e chaves SSH efêmeras.
+/run/
+
+# Arquivo scratch criado durante os experimentos iniciais.
+/teste
