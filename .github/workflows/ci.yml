@@ -98,7 +98,7 @@ jobs:
             exit 1
           fi
 
-          if git grep -l 'BEGIN OPENSSH PRIVATE KEY' -- ':!*.md'; then
+          if git grep -l 'BEGIN OPENSSH PRIVATE K[E]Y' -- ':!*.md'; then
             echo 'An OpenSSH private key was committed.' >&2
             exit 1
           fi
