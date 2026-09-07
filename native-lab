@@ -1,12 +1,26 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
 umask 077
 
+readonly CALLER_PATH=${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}
+readonly HOST_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PATH=$HOST_PATH
+export PATH
+
 readonly PROFILE="default"
-readonly POLICY_VERSION="1"
+readonly POLICY_VERSION="2"
 readonly STARTUP_TIMEOUT_SECONDS="5"
 readonly STOP_GRACE_SECONDS="2"
+
+POLICY_TMP=
+
+cleanup_client() {
+    if [[ -n "$POLICY_TMP" ]]; then
+        rm -f -- "$POLICY_TMP"
+    fi
+}
+trap cleanup_client EXIT
 
 die() {
     printf 'native-lab: %s\n' "$*" >&2
@@ -25,6 +39,31 @@ EOF
 
 need() {
     command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
+}
+
+path_is_within() {
+    local path=$1 root=$2
+    [[ "$path" == "$root" || "$path" == "$root/"* ]]
+}
+
+resolve_host_tool() {
+    local name=$1 variable=$2 candidate canonical
+    candidate=$(command -v -- "$name" 2>/dev/null) || die "missing dependency: $name"
+    [[ "$candidate" == /* ]] || die "host tool did not resolve to an absolute path: $name"
+    canonical=$(realpath -- "$candidate") || die "cannot canonicalize host tool: $candidate"
+    [[ -f "$canonical" && -x "$canonical" ]] || die "host tool is not executable: $canonical"
+    if path_is_within "$canonical" "$WORKSPACE"; then
+        die "refusing host tool resolved inside the workspace: $name -> $canonical"
+    fi
+    printf -v "$variable" '%s' "$canonical"
+}
+
+resolve_host_tcb() {
+    resolve_host_tool ssh SSH_BIN
+    resolve_host_tool socat SOCAT_BIN
+    resolve_host_tool python3 PYTHON_BIN
+    resolve_host_tool rg RG_BIN
+    resolve_host_tool nohup NOHUP_BIN
 }
 
 private_dir_ok() {
@@ -66,9 +105,25 @@ resolve_workspace() {
 
 compute_session_id() {
     local digest
-    digest=$(printf '%s\0%s\0%s' "$WORKSPACE" "$PROFILE" "$POLICY_VERSION" | sha256sum)
+    digest=$(printf '%s\0%s\0%s\0%s' \
+        "$WORKSPACE" "$PROFILE" "$POLICY_VERSION" "$POLICY_DIGEST" | sha256sum)
     digest=${digest%% *}
     SESSION_ID=${digest:0:24}
+}
+
+resolve_policy() {
+    POLICY_TMP="$RUNTIME_ROOT/.resolved-policy.$$.$RANDOM.json"
+    POLICY_DIGEST=$("$PYTHON_BIN" "$POLICY_HELPER" resolve \
+        --workspace "$WORKSPACE" \
+        --rg "$RG_BIN" \
+        --runtime-root "$RUNTIME_ROOT" \
+        --output "$POLICY_TMP") || die 'failed to resolve filesystem policy'
+    [[ "$POLICY_DIGEST" =~ ^[0-9a-f]{64}$ && -s "$POLICY_TMP" ]] ||
+        die 'policy compiler returned invalid output'
+    SANDBOX_HOME=$("$PYTHON_BIN" "$POLICY_HELPER" value --policy "$POLICY_TMP" --key home) ||
+        die 'cannot read sandbox home from resolved policy'
+    [[ "$SANDBOX_HOME" == /* ]] || die 'resolved policy returned an invalid sandbox home'
+    SANDBOX_RUNTIME="/run/user/$(id -u)"
 }
 
 setup_session_paths() {
@@ -80,6 +135,8 @@ setup_session_paths() {
     PID_FILE="$SESSION_DIR/holder.pid"
     INFO_FILE="$SESSION_DIR/session.info"
     LOG_FILE="$SESSION_DIR/daemon.log"
+    POLICY_FILE="$SESSION_DIR/resolved-policy.json"
+    MASK_FILE="$SESSION_DIR/deny-mask"
 }
 
 ensure_session_dirs() {
@@ -92,13 +149,14 @@ ensure_session_dirs() {
 }
 
 session_metadata_matches() {
-    local saved_workspace saved_profile saved_policy
+    local saved_workspace saved_profile saved_policy saved_digest
     [[ -s "$INFO_FILE" ]] || return 1
     saved_workspace=$(read_info_value "$INFO_FILE" workspace 2>/dev/null) || return 1
     saved_profile=$(read_info_value "$INFO_FILE" profile 2>/dev/null) || return 1
     saved_policy=$(read_info_value "$INFO_FILE" policy_version 2>/dev/null) || return 1
+    saved_digest=$(read_info_value "$INFO_FILE" policy_digest 2>/dev/null) || return 1
     [[ "$saved_workspace" == "$WORKSPACE" && "$saved_profile" == "$PROFILE" &&
-       "$saved_policy" == "$POLICY_VERSION" ]]
+       "$saved_policy" == "$POLICY_VERSION" && "$saved_digest" == "$POLICY_DIGEST" ]]
 }
 
 reject_metadata_collision() {
@@ -130,8 +188,9 @@ build_ssh_args() {
     # OpenSSH already prefixes ProxyCommand with "exec" when it invokes the
     # user's shell. Supplying another one would try to execute a program named
     # "exec" ("exec exec socat ...").
-    proxy="socat STDIO $(posix_quote "UNIX-CONNECT:$SOCK")"
+    proxy="$(posix_quote "$SOCAT_BIN") STDIO $(posix_quote "UNIX-CONNECT:$SOCK")"
     SSH_ARGS=(
+        -F /dev/null
         -T
         -o BatchMode=yes
         -o ConnectTimeout=1
@@ -157,7 +216,7 @@ session_alive() {
     IFS= read -r login_user <"$CONTROL_DIR/user" || return 1
     [[ -n "$login_user" ]] || return 1
     build_ssh_args
-    ssh "${SSH_ARGS[@]}" "$login_user@native-lab" true </dev/null >/dev/null 2>&1
+    "$SSH_BIN" "${SSH_ARGS[@]}" "$login_user@native-lab" true </dev/null >/dev/null 2>&1
 }
 
 cmdline_has_exact_arg() {
@@ -186,6 +245,7 @@ holder_matches() {
     cmdline_has_exact_arg "$HOLDER_PID" "$DAEMON" || return 1
     cmdline_has_exact_arg "$HOLDER_PID" "$SESSION_DIR" || return 1
     cmdline_has_exact_arg "$HOLDER_PID" "$WORKSPACE" || return 1
+    cmdline_has_exact_arg "$HOLDER_PID" "$POLICY_DIGEST" || return 1
 }
 
 terminate_holder() {
@@ -206,7 +266,24 @@ terminate_holder() {
 
 cleanup_stale_state() {
     rm -rf -- "$CONTROL_DIR"
-    rm -f -- "$PID_FILE" "$INFO_FILE"
+    rm -f -- "$PID_FILE" "$INFO_FILE" "$POLICY_FILE" "$MASK_FILE"
+}
+
+cleanup_session_synthetics() {
+    local cleanup_status
+    [[ -s "$POLICY_FILE" ]] || return 0
+    exec {POLICY_CLEANUP_FD}>"$RUNTIME_ROOT/policy-mount.lock"
+    flock -x "$POLICY_CLEANUP_FD"
+    set +e
+    "$PYTHON_BIN" "$POLICY_HELPER" unregister-synthetics \
+        --policy "$POLICY_FILE" \
+        --runtime-root "$RUNTIME_ROOT" \
+        --session-id "$SESSION_ID"
+    cleanup_status=$?
+    set -e
+    flock -u "$POLICY_CLEANUP_FD" 2>/dev/null || true
+    exec {POLICY_CLEANUP_FD}>&-
+    return "$cleanup_status"
 }
 
 acquire_lock() {
@@ -224,18 +301,23 @@ start_session() {
 
     cleanup_stale_state
     mkdir -m 700 -- "$CONTROL_DIR"
+    install -m 600 -- "$POLICY_TMP" "$POLICY_FILE"
     : >"$LOG_FILE"
 
     (
         # A client killed during startup must not leave the lock held by the
         # long-lived daemon through an inherited descriptor.
         exec {LOCK_FD}>&-
-        exec nohup "$DAEMON" \
+        exec "$NOHUP_BIN" "$DAEMON" \
             --workspace "$WORKSPACE" \
             --session-dir "$SESSION_DIR" \
             --session-id "$SESSION_ID" \
             --profile "$PROFILE" \
             --policy-version "$POLICY_VERSION" \
+            --policy-digest "$POLICY_DIGEST" \
+            --policy-file "$POLICY_FILE" \
+            --policy-helper "$POLICY_HELPER" \
+            --runtime-root "$RUNTIME_ROOT" \
             >>"$LOG_FILE" 2>&1 </dev/null
     ) &
 }
@@ -281,7 +363,7 @@ ensure_session() {
 
 encode_remote_command() {
     local arg
-    REMOTE_COMMAND="cd $(posix_quote "$WORKSPACE") && PATH=$(posix_quote "${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}") exec"
+    REMOTE_COMMAND="cd $(posix_quote "$WORKSPACE") && HOME=$(posix_quote "$SANDBOX_HOME") XDG_RUNTIME_DIR=$(posix_quote "$SANDBOX_RUNTIME") TMPDIR=/tmp PATH=$(posix_quote "$CALLER_PATH") exec"
     for arg in "$@"; do
         REMOTE_COMMAND+=" $(posix_quote "$arg")"
     done
@@ -293,8 +375,6 @@ run_command() {
         shift
         (($# > 0)) || usage
     fi
-    need ssh
-    need socat
     ensure_session_dirs
     ensure_session
     encode_remote_command "$@"
@@ -302,16 +382,20 @@ run_command() {
     local login_user
     IFS= read -r login_user <"$CONTROL_DIR/user"
     build_ssh_args
-    exec ssh "${SSH_ARGS[@]}" "$login_user@native-lab" "$REMOTE_COMMAND"
+    rm -f -- "$POLICY_TMP"
+    POLICY_TMP=
+    exec "$SSH_BIN" "${SSH_ARGS[@]}" "$login_user@native-lab" "$REMOTE_COMMAND"
 }
 
 status_command() {
-    local state=stopped holder='-' created='-'
+    local state=stopped holder='-' created='-' ro_count='-' trusted_count='-'
     if [[ -d "$SESSION_DIR" ]]; then
         private_dir_ok "$SESSION_DIR" || die "unsafe session directory: $SESSION_DIR"
         reject_metadata_collision
         holder=$(read_info_value "$PID_FILE" pid 2>/dev/null || printf '%s' '-')
         created=$(read_info_value "$INFO_FILE" created 2>/dev/null || printf '%s' '-')
+        ro_count=$(read_info_value "$INFO_FILE" read_only_root_count 2>/dev/null || printf '%s' '-')
+        trusted_count=$(read_info_value "$INFO_FILE" trusted_project_count 2>/dev/null || printf '%s' '-')
         if session_alive; then
             state=alive
         elif [[ -e "$PID_FILE" || -e "$SOCK" || -e "$INFO_FILE" ]]; then
@@ -323,6 +407,12 @@ status_command() {
     printf 'Session:         %s\n' "$SESSION_ID"
     printf 'Profile:         %s\n' "$PROFILE"
     printf 'Policy:          %s\n' "$POLICY_VERSION"
+    printf 'Policy digest:   %s\n' "$POLICY_DIGEST"
+    printf 'RO roots:        %s\n' "$ro_count"
+    printf 'Trusted projects: %s\n' "$trusted_count"
+    if [[ -s "$INFO_FILE" ]]; then
+        awk -F= '$1 == "trusted_project" { print "  - " substr($0, index($0, "=") + 1) }' "$INFO_FILE"
+    fi
     printf 'Runtime:         %s\n' "$SESSION_DIR"
     printf 'SSH socket:      %s\n' "$state"
     printf 'Holder PID:      %s\n' "$holder"
@@ -349,6 +439,10 @@ stop_command() {
             die 'holder could not be terminated safely'
         }
     fi
+    if ! cleanup_session_synthetics; then
+        release_lock
+        die 'holder stopped, but synthetic mountpoint cleanup failed closed; inspect daemon.log and workspace metadata'
+    fi
     cleanup_stale_state
     release_lock
     printf 'native-lab: stopped session %s\n' "$SESSION_ID"
@@ -363,10 +457,17 @@ main() {
     need awk
     validate_runtime_dir
     resolve_workspace
-    compute_session_id
-    setup_session_paths
     SCRIPT_DIR=$(dirname -- "$(realpath -- "$0")")
     DAEMON="$SCRIPT_DIR/native-labd"
+    POLICY_HELPER="$SCRIPT_DIR/native-lab-policy.py"
+    [[ -x "$DAEMON" ]] || die "missing executable: $DAEMON"
+    [[ -r "$POLICY_HELPER" ]] || die "missing policy helper: $POLICY_HELPER"
+    resolve_host_tcb
+    RUNTIME_ROOT="$XDG_RUNTIME_DIR/native-lab"
+    ensure_private_dir "$RUNTIME_ROOT"
+    resolve_policy
+    compute_session_id
+    setup_session_paths
 
     case "$1" in
         run)

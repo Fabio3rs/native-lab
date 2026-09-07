@@ -34,6 +34,7 @@ jobs:
             openssh-client \
             openssh-server \
             python3 \
+            ripgrep \
             shellcheck \
             socat \
             util-linux
@@ -63,9 +64,11 @@ jobs:
       - name: Check executable modes
         run: |
           test -x native-lab
+          test -x native-lab-policy.py
           test -x native-labd
           test -x native-lab-session
           test -x native-lab-smoke.sh
+          test -x native-lab-policy-smoke.sh
 
       - name: Check Bash syntax
         run: |
@@ -73,7 +76,11 @@ jobs:
             native-lab \
             native-labd \
             native-lab-session \
-            native-lab-smoke.sh
+            native-lab-smoke.sh \
+            native-lab-policy-smoke.sh
+
+      - name: Check Python syntax
+        run: PYTHONPYCACHEPREFIX=/tmp/native-lab-pycache python3 -m py_compile native-lab-policy.py
 
       - name: Run ShellCheck
         run: |
@@ -81,7 +88,8 @@ jobs:
             native-lab \
             native-labd \
             native-lab-session \
-            native-lab-smoke.sh
+            native-lab-smoke.sh \
+            native-lab-policy-smoke.sh
 
       - name: Reject committed runtime and private keys
         run: |
@@ -96,4 +104,7 @@ jobs:
           fi
 
       - name: Run native-lab smoke test
-        run: timeout 120 ./native-lab-smoke.sh
+        run: timeout 180 ./native-lab-smoke.sh
+
+      - name: Run filesystem policy smoke test
+        run: timeout 180 ./native-lab-policy-smoke.sh

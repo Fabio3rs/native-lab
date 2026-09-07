@@ -1,15 +1,16 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
 umask 077
 
+readonly HOST_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PATH=$HOST_PATH
+export PATH
+readonly MOUNT_SETUP_TIMEOUT_SECONDS=5
+
 die() {
     printf 'native-labd: %s\n' "$*" >&2
     exit 1
-}
-
-need() {
-    command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
 }
 
 write_atomic() {
@@ -20,11 +21,35 @@ write_atomic() {
     mv -f -- "$temporary" "$destination"
 }
 
+path_is_within() {
+    local path=$1 root=$2
+    [[ "$path" == "$root" || "$path" == "$root/"* ]]
+}
+
+resolve_host_tool() {
+    local name=$1 variable=$2 candidate canonical
+    candidate=$(command -v -- "$name" 2>/dev/null) || die "missing dependency: $name"
+    [[ "$candidate" == /* ]] || die "host tool did not resolve to an absolute path: $name"
+    canonical=$(realpath -- "$candidate") || die "cannot canonicalize host tool: $candidate"
+    [[ -f "$canonical" && -x "$canonical" ]] || die "host tool is not executable: $canonical"
+    if path_is_within "$canonical" "$WORKSPACE"; then
+        die "refusing host tool resolved inside the workspace: $name -> $canonical"
+    fi
+    printf -v "$variable" '%s' "$canonical"
+}
+
 WORKSPACE=
 SESSION_DIR=
 SESSION_ID=
 PROFILE=
 POLICY_VERSION=
+POLICY_DIGEST=
+POLICY_FILE=
+POLICY_HELPER=
+RUNTIME_ROOT=
+BWRAP_BIN=
+PYTHON_BIN=
+FLOCK_BIN=
 
 while (($#)); do
     case "$1" in
@@ -33,28 +58,58 @@ while (($#)); do
         --session-id) SESSION_ID=${2-}; shift 2 ;;
         --profile) PROFILE=${2-}; shift 2 ;;
         --policy-version) POLICY_VERSION=${2-}; shift 2 ;;
+        --policy-digest) POLICY_DIGEST=${2-}; shift 2 ;;
+        --policy-file) POLICY_FILE=${2-}; shift 2 ;;
+        --policy-helper) POLICY_HELPER=${2-}; shift 2 ;;
+        --runtime-root) RUNTIME_ROOT=${2-}; shift 2 ;;
         *) die "unknown or incomplete argument: $1" ;;
     esac
 done
 
 [[ -n "$WORKSPACE" && -n "$SESSION_DIR" && -n "$SESSION_ID" &&
-   -n "$PROFILE" && -n "$POLICY_VERSION" ]] || die 'incomplete configuration'
-[[ "$WORKSPACE" == /* && "$SESSION_DIR" == /* ]] || die 'paths must be absolute'
-[[ -d "$WORKSPACE" && ! -L "$SESSION_DIR" ]] || die 'invalid workspace or session directory'
-[[ "${PATH:-}" != *$'\n'* && "${PATH:-}" != *$'\r'* ]] || die 'PATH contains unsupported newlines'
+   -n "$PROFILE" && -n "$POLICY_VERSION" && -n "$POLICY_DIGEST" &&
+   -n "$POLICY_FILE" && -n "$POLICY_HELPER" && -n "$RUNTIME_ROOT" ]] ||
+    die 'incomplete configuration'
+[[ "$WORKSPACE" == /* && "$SESSION_DIR" == /* && "$POLICY_FILE" == /* &&
+   "$POLICY_HELPER" == /* && "$RUNTIME_ROOT" == /* ]] || die 'paths must be absolute'
+[[ -d "$WORKSPACE" && -d "$SESSION_DIR" && ! -L "$SESSION_DIR" ]] ||
+    die 'invalid workspace or session directory'
+[[ -d "$RUNTIME_ROOT" && ! -L "$RUNTIME_ROOT" ]] || die 'invalid runtime root'
+path_is_within "$SESSION_DIR" "$RUNTIME_ROOT" || die 'session directory is outside runtime root'
+[[ "$POLICY_DIGEST" =~ ^[0-9a-f]{64}$ ]] || die 'invalid policy digest'
+[[ "$POLICY_VERSION" == 2 ]] || die 'unsupported policy version'
+[[ -r "$POLICY_FILE" && -r "$POLICY_HELPER" ]] || die 'policy files are not readable'
 
-need bwrap
-need date
-need realpath
+resolve_host_tool bwrap BWRAP_BIN
+resolve_host_tool python3 PYTHON_BIN
+resolve_host_tool flock FLOCK_BIN
 
 SCRIPT_DIR=$(dirname -- "$(realpath -- "$0")")
 SESSION_SCRIPT="$SCRIPT_DIR/native-lab-session"
 [[ -x "$SESSION_SCRIPT" ]] || die "missing executable: $SESSION_SCRIPT"
 
+"$PYTHON_BIN" "$POLICY_HELPER" verify \
+    --policy "$POLICY_FILE" \
+    --workspace "$WORKSPACE" \
+    --policy-version "$POLICY_VERSION" \
+    --policy-digest "$POLICY_DIGEST"
+
 CONTROL_DIR="$SESSION_DIR/control"
 PID_FILE="$SESSION_DIR/holder.pid"
 INFO_FILE="$SESSION_DIR/session.info"
-[[ -d "$CONTROL_DIR" && ! -L "$CONTROL_DIR" ]] || die "invalid control directory: $CONTROL_DIR"
+SUMMARY_FILE="$SESSION_DIR/policy-summary.$$"
+BWRAP_ARGS_FILE="$SESSION_DIR/bwrap-args.$$"
+SYNTHETIC_FILE="$SESSION_DIR/synthetic-targets.$$"
+MASK_SOURCE="$SESSION_DIR/deny-mask"
+MOUNTS_READY="$CONTROL_DIR/.mounts-ready"
+MOUNTS_RELEASE="$CONTROL_DIR/.mounts-release"
+POLICY_MOUNT_LOCK="$RUNTIME_ROOT/policy-mount.lock"
+[[ -d "$CONTROL_DIR" && ! -L "$CONTROL_DIR" ]] ||
+    die "invalid control directory: $CONTROL_DIR"
+
+"$PYTHON_BIN" "$POLICY_HELPER" summary --policy "$POLICY_FILE" >"$SUMMARY_FILE"
+HOME_VALUE=$(awk -F= '$1 == "home" { print substr($0, index($0, "=") + 1); exit }' "$SUMMARY_FILE")
+[[ -n "$HOME_VALUE" && "$HOME_VALUE" == /* ]] || die 'policy has invalid sandbox home'
 
 START_TICKS=$(awk '{print $22}' "/proc/$$/stat")
 {
@@ -69,16 +124,46 @@ START_TICKS=$(awk '{print $22}' "/proc/$$/stat")
     printf 'policy_version=%s\n' "$POLICY_VERSION"
     printf 'created=%s\n' "$(date --iso-8601=seconds)"
     printf 'holder_pid=%s\n' "$$"
+    cat "$SUMMARY_FILE"
 } | write_atomic "$INFO_FILE"
+rm -f -- "$SUMMARY_FILE"
 
-PATH_VALUE=${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}
-HOME_VALUE=${HOME:-$WORKSPACE}
-USER_VALUE=${USER:-$(id -un)}
-LOGNAME_VALUE=${LOGNAME:-$USER_VALUE}
-SHELL_VALUE=${SHELL:-/bin/sh}
-LANG_VALUE=${LANG:-C.UTF-8}
+: >"$MASK_SOURCE"
+chmod 000 "$MASK_SOURCE"
+"$PYTHON_BIN" "$POLICY_HELPER" emit-bwrap \
+    --policy "$POLICY_FILE" \
+    --mask-source "$MASK_SOURCE" \
+    --args-output "$BWRAP_ARGS_FILE" \
+    --synthetic-output "$SYNTHETIC_FILE"
+rm -f -- "$SYNTHETIC_FILE"
+exec {BWRAP_ARGS_FD}<"$BWRAP_ARGS_FILE"
+
+rm -f -- "$MOUNTS_READY" "$MOUNTS_RELEASE"
+exec {POLICY_LOCK_FD}>"$POLICY_MOUNT_LOCK"
+"$FLOCK_BIN" -x "$POLICY_LOCK_FD"
 
 BWRAP_PID=
+SYNTHETICS_REGISTERED=0
+POLICY_LOCK_HELD=1
+
+# Callback invoked indirectly by the EXIT/signal trap.
+# shellcheck disable=SC2317
+unregister_synthetics() {
+    (( SYNTHETICS_REGISTERED )) || return 0
+    if (( ! POLICY_LOCK_HELD )); then
+        exec {POLICY_LOCK_FD}>"$POLICY_MOUNT_LOCK" || return 1
+        "$FLOCK_BIN" -x "$POLICY_LOCK_FD" || return 1
+        POLICY_LOCK_HELD=1
+    fi
+    if ! "$PYTHON_BIN" "$POLICY_HELPER" unregister-synthetics \
+        --policy "$POLICY_FILE" \
+        --runtime-root "$RUNTIME_ROOT" \
+        --session-id "$SESSION_ID"; then
+        return 1
+    fi
+    SYNTHETICS_REGISTERED=0
+}
+
 # Callback invoked indirectly by trap.
 # shellcheck disable=SC2317
 shutdown() {
@@ -88,44 +173,85 @@ shutdown() {
         kill -TERM "$BWRAP_PID" 2>/dev/null || true
         wait "$BWRAP_PID" 2>/dev/null || true
     fi
+    if ! unregister_synthetics; then
+        printf 'native-labd: failed to clean synthetic mountpoints; preserving them fail-closed\n' >&2
+    fi
+    if (( POLICY_LOCK_HELD )); then
+        "$FLOCK_BIN" -u "$POLICY_LOCK_FD" 2>/dev/null || true
+        exec {POLICY_LOCK_FD}>&- 2>/dev/null || true
+    fi
+    rm -f -- "$BWRAP_ARGS_FILE" "$MOUNTS_READY" "$MOUNTS_RELEASE"
     exit "$status"
 }
 trap shutdown EXIT INT TERM HUP
 
-bwrap \
-    --unshare-user \
-    --unshare-pid \
-    --unshare-ipc \
-    --unshare-net \
-    --unshare-uts \
-    --hostname native-lab \
-    --new-session \
-    --die-with-parent \
-    --cap-drop ALL \
-    --ro-bind / / \
-    --bind "$WORKSPACE" "$WORKSPACE" \
-    --tmpfs /tmp \
-    --tmpfs /run \
-    --dir /run/native-lab-control \
-    --bind "$CONTROL_DIR" /run/native-lab-control \
-    --proc /proc \
-    --dev /dev \
-    --chdir "$WORKSPACE" \
-    --clearenv \
-    --setenv PATH "$PATH_VALUE" \
-    --setenv HOME "$HOME_VALUE" \
-    --setenv USER "$USER_VALUE" \
-    --setenv LOGNAME "$LOGNAME_VALUE" \
-    --setenv SHELL "$SHELL_VALUE" \
-    --setenv LANG "$LANG_VALUE" \
-    --setenv TMPDIR /tmp \
-    --setenv NATIVE_LAB_WORKSPACE "$WORKSPACE" \
-    --setenv NATIVE_LAB_SESSION_ID "$SESSION_ID" \
-    -- "$SESSION_SCRIPT" &
+# Missing protected metadata needs a real mountpoint because bubblewrap cannot
+# create a child mount below a bind-mounted workspace without creating that
+# directory in the host workspace. Keep an ownership marker for the full
+# session lifetime; unregister_synthetics removes the empty placeholder only
+# after the last session using it exits.
+SYNTHETICS_REGISTERED=1
+"$PYTHON_BIN" "$POLICY_HELPER" register-synthetics \
+    --policy "$POLICY_FILE" \
+    --runtime-root "$RUNTIME_ROOT" \
+    --session-id "$SESSION_ID" \
+    --pid "$$" \
+    --start-ticks "$START_TICKS"
+
+INTERNAL_SESSION_SCRIPT=/run/native-lab-bootstrap/native-lab-session
+USER_VALUE=$(id -un)
+(
+    exec {POLICY_LOCK_FD}>&-
+    exec "$BWRAP_BIN" \
+        --unshare-user \
+        --unshare-pid \
+        --unshare-ipc \
+        --unshare-net \
+        --unshare-uts \
+        --hostname native-lab \
+        --new-session \
+        --die-with-parent \
+        --cap-drop ALL \
+        --args "$BWRAP_ARGS_FD" \
+        --dir /run/native-lab-bootstrap \
+        --ro-bind "$SESSION_SCRIPT" "$INTERNAL_SESSION_SCRIPT" \
+        --dir /run/native-lab-control \
+        --bind "$CONTROL_DIR" /run/native-lab-control \
+        --proc /proc \
+        --remount-ro / \
+        --chdir "$WORKSPACE" \
+        --clearenv \
+        --setenv PATH "$HOST_PATH" \
+        --setenv HOME "$HOME_VALUE" \
+        --setenv USER "$USER_VALUE" \
+        --setenv LOGNAME "$USER_VALUE" \
+        --setenv SHELL /bin/sh \
+        --setenv LANG C.UTF-8 \
+        --setenv TMPDIR /tmp \
+        --setenv XDG_RUNTIME_DIR "/run/user/$(id -u)" \
+        --setenv NATIVE_LAB_WORKSPACE "$WORKSPACE" \
+        --setenv NATIVE_LAB_SESSION_ID "$SESSION_ID" \
+        -- "$INTERNAL_SESSION_SCRIPT"
+) &
 BWRAP_PID=$!
+exec {BWRAP_ARGS_FD}>&-
+rm -f -- "$BWRAP_ARGS_FILE"
+
+deadline=$((SECONDS + MOUNT_SETUP_TIMEOUT_SECONDS))
+while [[ ! -e "$MOUNTS_READY" ]] && (( SECONDS < deadline )); do
+    sleep 0.05
+done
+[[ -f "$MOUNTS_READY" && ! -L "$MOUNTS_READY" ]] ||
+    die 'sandbox did not complete mount setup before timeout'
+: >"$MOUNTS_RELEASE"
+chmod 600 "$MOUNTS_RELEASE"
+"$FLOCK_BIN" -u "$POLICY_LOCK_FD"
+exec {POLICY_LOCK_FD}>&-
+POLICY_LOCK_HELD=0
 
 set +e
 wait "$BWRAP_PID"
 BWRAP_STATUS=$?
 set -e
+BWRAP_PID=
 exit "$BWRAP_STATUS"

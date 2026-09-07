@@ -3,3 +3,12 @@
 
 # Arquivo scratch criado durante os experimentos iniciais.
 /teste
+
+# Bytecode local do helper de policy.
+__pycache__/
+*.py[cod]
+
+# Workspaces descartáveis criados pelos smoke tests.
+/.native-lab-smoke.*
+/.native-lab-policy-smoke.*
+/.native-lab-registry.*

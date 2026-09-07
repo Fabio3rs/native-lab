@@ -197,3 +197,152 @@ Ele cria seu próprio `XDG_RUNTIME_DIR` em `/tmp`, testa concorrência, isolamen
 localhost interno, ausência de Internet, stdio, streaming, quoting, exit status,
 PATH para ferramentas como `npm`, recuperação stale e stop. Todo o runtime
 temporário é removido ao final.
+
+## Filesystem allowlist (policy v2)
+
+A raiz vazia foi validada substituindo o bind da raiz do host por uma sequência
+conceitualmente equivalente a:
+
+```bash
+bwrap \
+  --unshare-user \
+  --unshare-pid \
+  --unshare-net \
+  --tmpfs / \
+  --dev /dev \
+  --ro-bind /usr /usr \
+  --ro-bind /etc /etc \
+  --ro-bind /bin /bin \
+  --tmpfs /tmp \
+  --tmpfs /run \
+  --proc /proc \
+  -- sh -c 'test ! -e /var; command -v sshd; command -v python3'
+```
+
+Na implementação, os roots de sistema existentes são adicionados
+individualmente e o root final é remountado read-only. O workspace é bindado
+RW, HOME, `/tmp`, `/run` e `/dev/shm` são tmpfs privados, e somente o diretório
+de controle atravessa o `/run` privado.
+
+O teste consolidado que comprovou a policy é:
+
+```bash
+timeout 180 ./native-lab-policy-smoke.sh
+```
+
+Ele cria, sem consultar o config real da máquina:
+
+```text
+current/       workspace RW
+trusted/       entrada trust_level="trusted"
+untrusted/     entrada trust_level="untrusted"
+extra-ro/      configuração NativeLab explícita
+config.toml    configs Codex e NativeLab temporários
+```
+
+Foram confirmados:
+
+- arquivos normais, `.env` e `.pem` do workspace atual acessíveis e RW;
+- `.git`, `.agents` e `.codex` do workspace inacessíveis;
+- projeto trusted RO e projeto untrusted ausente;
+- `.env*`, chaves/certificados e metadata do trusted negados;
+- `~/.npm-global` executável mas RO e `~/.npm` legível mas RO;
+- HOME real, browser profiles, host runtime, D-Bus e host `/dev/shm` ausentes;
+- mudança de trust ou de `extra_read_only` alterando digest e session id;
+- executável `rg` falso no PATH do workspace não usado pelo launcher.
+
+## TOML do Codex observado
+
+O import usa a tabela top-level `projects` do config global do Codex:
+
+```toml
+[projects."/caminho/absoluto"]
+trust_level = "trusted"
+```
+
+O parser é `tomllib` da stdlib. Tabelas e opções do Codex não relacionadas são
+ignoradas; somente `projects.<path>.trust_level == "trusted"` concede o mount
+RO. O config NativeLab é propositalmente mais estrito e rejeita chaves
+desconhecidas, tipos errados, symlink, owner diferente ou modo gravável por
+group/others.
+
+O manifest pode ser inspecionado sem iniciar bubblewrap:
+
+```bash
+runtime=$(mktemp -d /tmp/native-lab-policy.XXXXXX)
+chmod 700 "$runtime"
+./native-lab-policy.py resolve \
+  --workspace "$PWD" \
+  --rg /usr/bin/rg \
+  --runtime-root "$runtime" \
+  --output "$runtime/policy.json"
+python3 -m json.tool "$runtime/policy.json"
+```
+
+O stdout do `resolve` é o SHA-256 da representação canônica sem o próprio
+campo digest. Nenhum TOML é transformado em shell e não há `eval`.
+
+## Masks de arquivos
+
+A primeira tentativa de mascarar cada arquivo com `--ro-bind-data` reutilizou
+um único file descriptor. Bubblewrap 0.9.0 fecha o FD após consumi-lo, então o
+segundo mask falhou com file descriptor inválido. A implementação final cria
+um único arquivo regular mode `000` no session dir e usa `--ro-bind` dele para
+cada destino de arquivo. Diretórios usam tmpfs mode `000` e read-only.
+
+As identidades `st_dev`/`st_ino` de paths protegidos existentes são registradas
+no manifest e verificadas novamente pelo holder antes de criar o sandbox.
+Symlinks e objetos não regulares/não diretórios falham fechado.
+
+## Por que os mountpoints sintéticos persistem
+
+Para negar um `.git` que ainda não existe dentro de um workspace bindado RW,
+bubblewrap precisa de um mountpoint nesse workspace. Foi testada uma estratégia
+de remover o diretório host assim que o mount estivesse pronto. Ela não é
+segura: depois da remoção, um comando dentro da sessão conseguiu recriar o nome
+através do bind RW; num probe, `touch .codex` produziu um arquivo persistente no
+host. Um monitor por polling apenas reduzia a corrida e não constituía DENY.
+
+A decisão do PoC passou a ser manter o mountpoint vazio durante a sessão. O
+probe usado seguiu esta forma:
+
+```bash
+native-lab run sh -c '
+  for path in .git .agents .codex; do
+    test -d "$path"
+    test ! -r "$path"
+    ! touch "$path/probe" 2>/dev/null
+  done
+'
+
+native-lab status
+native-lab run true
+native-lab stop
+```
+
+No host, os diretórios existiam vazios enquanto `status` mostrava `alive`; após
+`stop`, somente os que tinham sido criados pelo NativeLab desapareceram. O
+registro de ownership usa PID + start-time de `/proc`, inode do target e um
+marker por session id. Um lock global serializa resolução, registro e cleanup.
+
+Esse comportamento é deliberadamente visível e está documentado no README.
+Ele evita a corrida causada pelo processo sandboxed, mas não pretende se
+defender de outro processo host-side malicioso executando como o mesmo usuário.
+
+## Execução dos testes a partir do Codex
+
+Uma aprovação de comando significa que o launcher e o smoke test rodam no host.
+Isso é necessário porque o sandbox externo do Codex pode bloquear a criação de
+network namespaces. O comando aprovado inicia `native-lab`, e **só então** os
+comandos passados a `native-lab run` executam no bubblewrap interno.
+
+Nesta rodada foram executados no host:
+
+```bash
+timeout 180 ./native-lab-policy-smoke.sh
+timeout 180 ./native-lab-smoke.sh
+```
+
+Ambos terminaram com todos os testes passando. O tempo mostrado antes do clique
+de aprovação era espera da interface; a execução começou após o usuário
+autorizar e terminou imediatamente/rapidamente.

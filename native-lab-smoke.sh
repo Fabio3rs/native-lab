@@ -4,8 +4,18 @@ set -euo pipefail
 ROOT=$(dirname -- "$(realpath -- "$0")")
 NATIVE_LAB="$ROOT/native-lab"
 TEST_RUNTIME=$(mktemp -d /tmp/native-lab-smoke.XXXXXX)
+TEST_CONFIG=$(mktemp -d /tmp/native-lab-smoke-config.XXXXXX)
 chmod 700 "$TEST_RUNTIME"
 export XDG_RUNTIME_DIR="$TEST_RUNTIME"
+export XDG_CONFIG_HOME="$TEST_CONFIG"
+mkdir -m 700 "$TEST_CONFIG/native-lab"
+printf '%s\n' \
+    'version = 1' \
+    '' \
+    '[codex]' \
+    'import_trusted_projects = false' \
+    >"$TEST_CONFIG/native-lab/config.toml"
+chmod 600 "$TEST_CONFIG/native-lab/config.toml"
 
 INTERNAL_PORT=$((20000 + $$ % 10000))
 HOST_PORT=$((INTERNAL_PORT + 1))
@@ -31,6 +41,7 @@ cleanup() {
     wait "$INTERNAL_CLIENT_PID" 2>/dev/null
     wait "$HOST_SERVER_PID" 2>/dev/null
     rm -rf -- "$TEST_RUNTIME"
+    rm -rf -- "$TEST_CONFIG"
     exit "$status"
 }
 trap cleanup EXIT INT TERM HUP
@@ -83,7 +94,7 @@ pass 'network, mount and PID namespaces are private'
 
 cap_eff=$("$NATIVE_LAB" run sh -c "awk '/CapEff/ {print \$2}' /proc/self/status")
 [[ "$cap_eff" == 0000000000000000 ]] || fail "effective capabilities are not empty: $cap_eff"
-pass 'policy 1 drops all effective capabilities'
+pass 'policy 2 drops all effective capabilities'
 
 # Variables and substitutions in this string intentionally belong to the
 # remote shell inside native-lab.
@@ -92,7 +103,8 @@ pass 'policy 1 drops all effective capabilities'
     test ! -e "/run/user/$(id -u)/bus"
     test ! -e /tmp/.X11-unix
     test -d /run/native-lab-control
-    test "$(find /run -mindepth 1 -maxdepth 1 | wc -l)" -eq 1
+    test -d "/run/user/$(id -u)"
+    test "$XDG_RUNTIME_DIR" = "/run/user/$(id -u)"
 ' || fail '/run exposes more than the control directory'
 pass '/run and host desktop sockets are private'
 
@@ -101,14 +113,24 @@ pass '/run and host desktop sockets are private'
 # shellcheck disable=SC2016
 "$NATIVE_LAB" run sh -c '
     workspace_probe="$PWD/.native-lab-write-probe.$$"
+    home_probe="$HOME/.native-lab-private-home-probe"
     : >"$workspace_probe"
     rm -f -- "$workspace_probe"
-    if touch "$HOME/.native-lab-ro-probe.$$" 2>/dev/null; then
-        rm -f -- "$HOME/.native-lab-ro-probe.$$"
-        exit 1
-    fi
+    : >"$home_probe"
+    test -e "$home_probe"
+    test ! -e /var
 ' || fail 'filesystem read-only boundary is incorrect'
-pass 'workspace is writable while the user home outside it is read-only'
+[[ ! -e "$HOME/.native-lab-private-home-probe" ]] || fail 'sandbox HOME leaked to host HOME'
+pass 'workspace is writable while HOME is private and host /var is absent'
+
+shm_probe="native-lab-host-shm-$$"
+[[ ! -e "/dev/shm/$shm_probe" ]] || fail 'host shm probe unexpectedly exists'
+# $probe is intentionally expanded by the remote shell.
+# shellcheck disable=SC2016
+"$NATIVE_LAB" run sh -c 'probe=$1; : >"/dev/shm/$probe"; test -e "/dev/shm/$probe"' _ "$shm_probe" ||
+    fail '/dev/shm is not writable in the sandbox'
+[[ ! -e "/dev/shm/$shm_probe" ]] || fail 'sandbox /dev/shm leaked to host /dev/shm'
+pass '/dev/shm is private and writable'
 
 if curl --silent --show-error --max-time 0.3 "http://127.0.0.1:$INTERNAL_PORT" >/dev/null 2>&1; then
     fail "host port $INTERNAL_PORT is already occupied"

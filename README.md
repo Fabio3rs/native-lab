@@ -1,428 +1,418 @@
-# native-lab
+# NativeLab
 
 > [!CAUTION]
-> **Este projeto é somente uma prova de conceito experimental e potencialmente
-> perigosa. Ele não foi auditado e não deve ser tratado como uma fronteira de
-> segurança para executar código hostil, malware, instaladores desconhecidos ou
-> dependências não confiáveis.**
+> **NativeLab é uma prova de conceito experimental, não auditada e
+> potencialmente perigosa. Não a trate como uma fronteira de segurança para
+> malware, instaladores desconhecidos, dependências hostis ou dados valiosos.**
 
-`native-lab` mantém uma sessão bubblewrap persistente por workspace. Processos
-iniciados em chamadas diferentes compartilham os mesmos namespaces e, portanto,
-o mesmo localhost privado:
+NativeLab mantém uma sessão `bubblewrap` persistente por workspace. Chamadas
+separadas entram nessa sessão por OpenSSH sobre Unix socket e compartilham os
+mesmos namespaces, inclusive o localhost privado:
 
 ```text
 native-lab run npm run dev
                     │
-                    │ mesma sessão / mesmo localhost
+                    │ mesma sessão / 127.0.0.1
                     ▼
-native-lab run curl http://127.0.0.1:5173
+native-lab run npx @playwright/mcp ...
 ```
 
-Comandos posteriores entram na sessão por SSH sobre um Unix socket. O SSH é
-usado deliberadamente como transporte de execução, stdin, stdout, stderr e exit
-status; não existe um protocolo próprio de daemon ou multiplexação de pipes.
+O SSH transporta stdin, stdout, stderr, EOF e exit status. Não há protocolo
+próprio de daemon, multiplexador de pipes ou tmux.
 
-## Leia isto antes de executar
+## O alerta de segurança, sem eufemismos
 
-O objetivo atual é validar arquitetura e comportamento, não oferecer isolamento
-forte contra um atacante. As limitações mais importantes são:
+Este PoC reduz bastante o que um processo enxerga, mas ainda compartilha o
+kernel e vários recursos escolhidos do host. Um bug no kernel, no bubblewrap,
+no parser, nos scripts ou na composição dos mounts pode romper as premissas.
 
-### O filesystem do host continua legível
+Em particular:
 
-O sandbox começa com:
+- o workspace atual é persistente e read-write; código executado pode alterar
+  ou apagar quase qualquer arquivo nele, exceto os metadados mascarados;
+- `.env`, `*.pem`, `*.key` e outros secrets do workspace atual são acessíveis
+  deliberadamente;
+- `~/.npm-global` e `~/.npm`, quando existem, são montados read-only. Isso
+  impede persistência pela sandbox, mas permite ler e executar conteúdo que já
+  existe nesses diretórios;
+- `extra_read_only` pode expor qualquer dado que o usuário colocar ali;
+- `/etc` é uma visão read-only do host e pode conter informação legível pelo
+  usuário;
+- projetos trusted são filtrados por nomes/globs, não por classificação do
+  conteúdo. Um segredo com nome inesperado continua visível;
+- read-only impede escrita pela sandbox, mas não cria um snapshot imutável. Um
+  processo no host ainda pode mudar uma origem montada durante a sessão;
+- a ausência de Internet reduz caminhos de exfiltração, mas dados ainda podem
+  ser escritos no workspace, enviados a outro processo no localhost da sessão
+  ou impressos;
+- o control plane compartilhado é gravável pela própria sandbox. Código dentro
+  dela pode derrubar o socket, destruir chaves efêmeras ou causar denial of
+  service;
+- não existem cgroups, quota, limites de CPU/memória/processos, seccomp próprio,
+  Landlock próprio, pidfd ou proteção contra fork bomb;
+- não há isolamento de VM: todos os processos usam o kernel do host;
+- a implementação é shell + Python e não recebeu auditoria de segurança.
+
+Use somente em workspaces descartáveis ou versionados, mantenha backups e
+execute apenas código cujo risco você aceita. Falha ao criar qualquer
+propriedade essencial encerra o startup; não existe fallback para execução
+direta no host.
+
+## Filesystem policy v2
+
+A raiz não é mais `--ro-bind / /`. Ela começa vazia com `--tmpfs /`, e somente
+origens explicitamente permitidas são montadas:
+
+| Visão dentro da sessão | Policy |
+| --- | --- |
+| `/bin`, `/sbin`, `/usr`, `/etc`, `/lib`, `/lib64` | host RO, se existirem |
+| `/nix/store`, `/run/current-system/sw` | host RO, se existirem |
+| `~/.npm-global`, `~/.npm` | host RO, se existirem |
+| workspace canônico atual | host RW |
+| `.git`, `.agents`, `.codex` do workspace | DENY |
+| projetos trusted importados | host RO com masks adicionais |
+| HOME real restante | não montado |
+| pathname lógico do HOME | tmpfs privado RW |
+| `/tmp`, `/run`, `/dev/shm` | privados RW |
+| `/proc` | novo procfs do PID namespace |
+| `/dev` | conjunto mínimo criado pelo bubblewrap |
+| `/var`, `/home` e demais árvores | ausentes, salvo mount explícito |
+
+O HOME mantém o pathname retornado por `getpwuid(3)`, por exemplo
+`/home/fabio`, mas seu conteúdo começa privado e vazio. Os mounts npm são
+aplicados por cima desse HOME. Assim, symlinks como
+`~/.npm-global/bin/npm -> ../lib/node_modules/...` continuam funcionando sem
+expor o restante do HOME.
+
+`XDG_RUNTIME_DIR` dentro da sessão é `/run/user/$UID`, criado privadamente com
+modo `0700`. Ele não é o `$XDG_RUNTIME_DIR` do host. Portanto D-Bus, Wayland,
+PipeWire/PulseAudio, gpg-agent, ssh-agent e sockets X11 do host não atravessam
+a fronteira. `/dev/shm` também é privado para permitir navegador/Xvfb sem
+compartilhar a memória POSIX do host.
+
+### Workspace atual
+
+O resultado de `realpath "$PWD"` é o único root persistente RW. Secrets que
+pertencem ao trabalho ativo continuam disponíveis:
 
 ```text
---ro-bind / /
+.env                 acessível
+cert.pem              acessível
+private.key           acessível
+.git                  negado
+.agents               negado
+.codex                negado
 ```
 
-Isso impede escrita na maior parte da raiz, mas **não esconde arquivos**. Todo
-arquivo que o usuário atual consegue ler no host normalmente continua legível
-dentro da sessão, incluindo potencialmente:
+Para caminhos protegidos existentes, NativeLab valida tipo e identidade e
+aplica um mount opaco. Symlinks nesses pontos fazem o startup falhar fechado.
 
-- chaves e configurações em `$HOME`;
-- tokens de CLIs e credenciais de cloud;
-- código-fonte fora do workspace;
-- configurações do Git, npm e outras ferramentas;
-- informações expostas por `/sys` e outras árvores read-only.
+Quando `.git`, `.agents` ou `.codex` ainda não existe, bubblewrap precisa de um
+mountpoint real sob o bind RW. A solução escolhida para este PoC é visível no
+host: NativeLab cria um **diretório vazio temporário** com esse nome e o mantém
+durante toda a sessão. Dentro da sandbox ele fica coberto por tmpfs mode `000`
+e read-only, portanto não pode ser lido nem receber conteúdo persistente.
 
-Read-only não protege confidencialidade. Um comando malicioso poderia ler um
-segredo e escrevê-lo no workspace, imprimi-lo no terminal ou deixá-lo preparado
-para exfiltração posterior. A ausência de Internet reduz alguns caminhos de
-exfiltração, mas não torna esse desenho seguro para código hostil.
+Ownership desses placeholders é registrado sob
+`$XDG_RUNTIME_DIR/native-lab/synthetic-mounts/`. `stop` remove apenas um
+placeholder ainda vazio, com a identidade esperada e sem outro holder ativo.
+Múltiplas sessões são contabilizadas. Após `SIGKILL`, a próxima resolução de
+policy descarta markers de PIDs mortos e recupera o estado. Se o path mudou de
+tipo ou ganhou conteúdo, NativeLab falha fechado e não o apaga.
 
-### O workspace é totalmente gravável
+Consequência operacional: enquanto uma sessão estiver viva, ferramentas no
+host verão esses diretórios vazios no workspace. Isso é uma limitação aceita e
+documentada do PoC, não um detalhe invisível da implementação.
 
-O diretório retornado por `realpath "$PWD"` é rebindado read-write. Qualquer
-processo da sessão pode criar, alterar, truncar, renomear ou apagar arquivos que
-o usuário conseguir modificar nesse workspace.
+### Projetos trusted do Codex
 
-Execute `native-lab` a partir do diretório exato que deseja tornar gravável. Se
-ele for iniciado em um diretório amplo, como o próprio `$HOME`, todo esse
-diretório será considerado workspace e ficará gravável no sandbox.
+Por padrão, NativeLab lê o config global configurado e reconhece o formato:
 
-Workspaces em `/`, `/run`, `/tmp`, `/proc` e `/dev` são rejeitados porque
-conflitariam com os mounts privados essenciais, mas essa validação não impede o
-usuário de escolher outros diretórios excessivamente amplos.
+```toml
+[projects."/mnt/projects/Projects/projeto-a"]
+trust_level = "trusted"
 
-Use controle de versão, backups e dados descartáveis.
-
-### Isto compartilha o kernel do host
-
-Bubblewrap usa namespaces; não é uma máquina virtual. Os processos continuam
-usando o mesmo kernel do host. A policy atual:
-
-- cria user, PID, IPC, network e UTS namespaces;
-- remove todas as capabilities efetivas com `--cap-drop ALL`;
-- não instala uma política seccomp própria;
-- não instala uma política Landlock, SELinux ou AppArmor própria;
-- não oferece proteção contra vulnerabilidades do kernel.
-
-Remover capabilities é uma camada útil, mas não transforma o PoC em isolamento
-adequado para código adversarial.
-
-### Não existem limites de recursos
-
-Não há cgroups, limites de CPU ou memória, quota de disco, limite de processos
-ou supervisor resistente a fork bombs. Um processo pode consumir recursos do
-usuário ou do host até os limites externos já existentes.
-
-### O canal de controle é compartilhado e gravável
-
-O único diretório deliberadamente compartilhado entre host e sandbox contém o
-socket SSH e suas chaves efêmeras. Ele é gravável pela sessão. Um processo
-malicioso dentro do sandbox pode causar denial of service, remover o socket,
-alterar credenciais da sessão ou tentar se passar pelo listener para execuções
-posteriores.
-
-As permissões `0700`/`0600`, autenticação por chave e known-hosts dedicado
-protegem contra outros usuários do host em condições normais. Elas não protegem
-o canal contra código já executando dentro da própria sessão.
-
-### O código é um PoC em shell
-
-O lifecycle possui flock, probe funcional por SSH e validação de PID,
-start-time e argv antes de enviar sinais. Mesmo assim, não há pidfd, daemon de
-sistema, journal estruturado, atualização transacional ou auditoria de
-segurança. Corridas e casos de falha ainda podem existir.
-
-## O que o PoC isola
-
-Com a policy version 1, o layout conceitual é:
-
-| Recurso | Comportamento |
-| --- | --- |
-| `/` | Bind recursivo read-only do host |
-| Workspace | Bind read-write no mesmo caminho absoluto |
-| `/tmp` | tmpfs privado |
-| `/run` | tmpfs privado |
-| `/run/native-lab-control` | Único bind de controle compartilhado |
-| `/proc` | procfs do novo PID namespace |
-| `/dev` | Dispositivos mínimos criados pelo bubblewrap |
-| Rede | Network namespace privado, apenas loopback |
-| Capabilities | Todas removidas |
-
-Consequências verificadas pelo smoke test:
-
-- processos de chamadas diferentes alcançam uns aos outros em `127.0.0.1`;
-- o localhost do host não aparece dentro da sessão;
-- serviços da sessão não aparecem no localhost do host;
-- a sessão não alcança a Internet;
-- o bus D-Bus, SSH agent, X11 e demais sockets do `$XDG_RUNTIME_DIR` do host não
-  são montados;
-- caminhos fora do workspace permanecem read-only dentro do possível.
-
-Isso descreve o host em que o PoC foi testado. Configuração do kernel,
-bubblewrap, LSMs e namespaces pode variar entre distribuições. Falhar ao criar
-qualquer propriedade essencial encerra o startup; não há fallback para execução
-no host.
-
-## Requisitos
-
-- Linux com user namespaces habilitados;
-- Bash;
-- bubblewrap (`bwrap`);
-- socat;
-- cliente e servidor OpenSSH (`ssh`, `sshd`, `ssh-keygen`);
-- `flock`, `realpath`, `sha256sum`, `stat`, `awk` e ferramentas Unix usuais;
-- `$XDG_RUNTIME_DIR` válido.
-
-`$XDG_RUNTIME_DIR` precisa ser absoluto, existir, pertencer ao usuário atual,
-ter modo `0700` e permitir escrita e travessia. O programa falha explicitamente
-caso isso não seja verdade.
-
-Os executáveis `native-lab`, `native-labd` e `native-lab-session` devem
-permanecer juntos. `native-lab` resolve seu próprio caminho real para localizar
-os outros dois.
-
-## Uso
-
-Execute a partir do workspace desejado:
-
-```bash
-./native-lab run COMMAND [ARGS...]
-./native-lab status
-./native-lab stop
+[projects."/mnt/projects/Projects/projeto-b"]
+trust_level = "untrusted"
 ```
+
+Somente tabelas sob `projects` cujo `trust_level` é exatamente `"trusted"` são
+importadas. Os paths são expandidos, canonicalizados, deduplicados e precisam
+existir. O workspace atual mantém precedência RW. `/`, o HOME e qualquer
+ancestor que exponha todo o HOME são ignorados com warning.
+
+Cada projeto importado é RO. Os seguintes paths são negados:
+
+```text
+.git
+.agents
+.codex
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+```
+
+Os matches são expandidos no host antes do `bwrap` com `rg --files --hidden
+--no-ignore`. Um match que seja symlink ou outro objeto inesperado aborta a
+sessão. Não existe fallback silencioso que amplie acesso.
+
+## Configuração confiável
+
+O único config NativeLab procurado é:
+
+```text
+${XDG_CONFIG_HOME:-$HOME/.config}/native-lab/config.toml
+```
+
+Não se lê configuração do workspace, não há `--config` e não existe
+`NATIVE_LAB_CONFIG`. O arquivo, quando presente, deve ser regular, pertencer ao
+usuário, não ser symlink e não ter escrita para group/others.
+
+Defaults equivalentes:
+
+```toml
+version = 1
+
+[codex]
+import_trusted_projects = true
+config_path = "~/.codex/config.toml"
+
+[filesystem]
+extra_read_only = []
+extra_trusted_project_deny_globs = []
+```
+
+`extra_read_only` adiciona paths aos defaults; não os substitui. Não existe
+`extra_read_write`: o workspace permanece o único root persistente RW.
+`extra_trusted_project_deny_globs` adiciona globs relativos a cada projeto
+trusted. `~` e `~/...` são expandidos sem `eval` usando o HOME real.
 
 Exemplo:
 
-```bash
-./native-lab run npm run dev
+```toml
+version = 1
+
+[codex]
+import_trusted_projects = true
+config_path = "~/.codex/config.toml"
+
+[filesystem]
+extra_read_only = ["~/sdk-reference"]
+extra_trusted_project_deny_globs = ["**/*.secret", "**/credentials.json"]
 ```
 
-Em outro terminal, no mesmo diretório canônico:
+Tanto esse arquivo quanto o config do Codex são parseados por `python3` com
+`tomllib`. O helper produz JSON canônico e argumentos NUL-delimited; ele nunca
+gera shell para `eval`.
 
-```bash
-./native-lab run curl http://127.0.0.1:5173
+## Policy digest e identidade da sessão
+
+`POLICY_VERSION=2`. Antes de escolher uma sessão, o launcher resolve e ordena:
+
+- roots RW e RO;
+- projetos trusted;
+- masks concretos e regras DENY;
+- metadata protegida;
+- opções relevantes dos configs.
+
+O JSON canônico recebe SHA-256, formando `POLICY_DIGEST`. O session id usa:
+
+```text
+workspace + NUL + profile + NUL + policy_version + NUL + policy_digest
 ```
 
-Também é aceito `--` antes do comando:
+Assim, adicionar/remover trust no Codex ou mudar `extra_read_only` produz outro
+ID e não reutiliza uma sandbox criada com autorização anterior. O manifest
+resolvido e o resumo ficam no runtime; `status` mostra digest, número de roots
+RO e projetos trusted.
+
+Uma sessão antiga já em execução não perde retroativamente seus mounts quando
+o config muda. Pare a sessão antes de revogar acesso se houver processos
+long-lived; mudar o config garante não-reuso nas próximas chamadas, não revoga
+um processo que já existe.
+
+## Ambiente e host-side TCB
+
+O `bwrap` usa `--clearenv` e define apenas um ambiente básico. Não são
+encaminhados automaticamente `SSH_AUTH_SOCK`, D-Bus, display, Xauthority,
+gpg-agent, tokens ou credenciais cloud. O comando remoto recebe o PATH original
+do caller, HOME privado, TMPDIR privado e XDG_RUNTIME_DIR privado.
+
+O PATH do caller não é usado para construir a sandbox. `bwrap`, `ssh`, `socat`,
+`python3`, `rg`, `nohup` e `flock` são resolvidos por um PATH host-side fixo,
+canonicalizados e rejeitados se estiverem dentro do workspace. O SSH ignora o
+config pessoal do cliente com `-F /dev/null`.
+
+Preservar o PATH remoto permite executar `~/.npm-global/bin/npm` e `npx`, mas
+não garante que todo componente desse PATH tenha sido montado. `npm install -g`
+no prefixo host falhar por read-only é comportamento esperado. Sem Internet,
+`npx -y` só funciona quando o pacote necessário já está disponível.
+
+## Namespaces, rede e capabilities
+
+O holder exige:
+
+```text
+--unshare-user --unshare-pid --unshare-ipc
+--unshare-net  --unshare-uts --new-session
+--cap-drop ALL --die-with-parent
+```
+
+Loopback funciona entre processos da mesma sessão. O localhost do host não é
+visível, a sessão não é visível pelo localhost do host e não há rota para a
+Internet.
+
+Capabilities são atualmente sempre removidas. GDB pode funcionar em alguns
+casos sem `CAP_SYS_PTRACE`, dependendo de UID, relação pai/filho, Yama e seccomp.
+Programas que realmente precisarem de ptrace ou outra capability exigirão um
+profile futuro explícito e um novo fingerprint de policy; este PoC não oferece
+essa customização ainda.
+
+## Requisitos e instalação
+
+- Linux com user namespaces e network namespaces habilitados;
+- Bash;
+- Python 3.11+ (`tomllib` na stdlib);
+- bubblewrap, socat e ripgrep;
+- cliente e servidor OpenSSH;
+- `flock`, `realpath`, `sha256sum`, `stat`, `awk` e ferramentas Unix usuais;
+- `$XDG_RUNTIME_DIR` válido.
+
+Mantenha juntos e executáveis:
+
+```text
+native-lab
+native-labd
+native-lab-session
+native-lab-policy.py
+```
+
+`XDG_RUNTIME_DIR` deve ser absoluto, existir, pertencer ao usuário, ter modo
+`0700` e ser gravável/pesquisável. Ausência ou permissão diferente causa erro
+explícito.
+
+## Uso
+
+No diretório exato que deve ser RW:
 
 ```bash
-./native-lab run -- sh -c 'exit 37'
+native-lab run COMMAND [ARGS...]
+native-lab status
+native-lab stop
+```
+
+Exemplos:
+
+```bash
+native-lab run npm run dev
+native-lab run curl http://127.0.0.1:5173
+native-lab run -- sh -c 'exit 37'
 echo "$?"
 # 37
 ```
 
-O workspace é exatamente o `$PWD` canônico. Rodar a CLI em dois subdiretórios
-diferentes cria duas sessões diferentes, mesmo que ambos pertençam ao mesmo
-repositório. A opção `--workspace` ainda não existe.
+O modo padrão usa `ssh -T`: não há PTY, stdin atravessa, stdout e stderr ficam
+separados e o exit status é preservado. Argumentos passam por quoting POSIX
+cuidadoso. Um futuro `native-lab-exec` poderia substituir essa camada por argv
+serializado e `execve(2)`.
 
-### Semântica de `run`
+TTY, aplicações full-screen e prompts de senha estão fora desta etapa.
 
-O modo padrão usa SSH sem PTY (`ssh -T`):
-
-```text
-stdin  do caller -> comando
-stdout do comando -> stdout do caller
-stderr do comando -> stderr do caller
-exit do comando -> exit do native-lab/ssh
-```
-
-Programas que exigem terminal interativo, TTY, interface full-screen ou prompt
-de senha não fazem parte desta etapa.
-
-Os argumentos são transportados por quoting POSIX, inclusive valores vazios,
-espaços, aspas e quebras de linha. O PATH do caller é aplicado à resolução do
-comando remoto. As demais variáveis de ambiente do caller não são encaminhadas
-automaticamente.
-
-### Limitações para npm e npx
-
-O PATH é preservado para que instalações do usuário, como
-`$HOME/.npm-global/bin/npm`, possam ser encontradas. Entretanto:
-
-- o `$HOME` do host permanece read-only;
-- a Internet está desabilitada;
-- `npx -y` não conseguirá baixar pacotes ausentes;
-- ferramentas que precisam escrever caches em `$HOME` podem falhar.
-
-Para este PoC, dependências devem estar no workspace ou já disponíveis de forma
-compatível com essas restrições. Montagem seletiva de caches ou um HOME privado
-gravável é trabalho futuro e precisa ser avaliada como mudança de policy.
-
-## Identificação e runtime
-
-A sessão é identificada por SHA-256 de:
+## Runtime e lifecycle
 
 ```text
-realpath($PWD) + NUL + profile + NUL + policy_version
+$XDG_RUNTIME_DIR/native-lab/
+├── policy-mount.lock
+├── synthetic-mounts/
+└── <session-id>/
+    ├── start.lock
+    ├── holder.pid
+    ├── session.info
+    ├── resolved-policy.json
+    ├── deny-mask
+    ├── daemon.log
+    └── control/
+        ├── lab-ssh.sock
+        ├── client_ed25519
+        ├── ssh_host_ed25519_key
+        ├── authorized_keys
+        ├── known_hosts
+        ├── sshd_config
+        └── ...
 ```
 
-São usados os primeiros 24 caracteres. Atualmente:
+Startup concorrente é serializado por `flock`. Um PID ou socket isolado não
+declara prontidão: o cliente executa um probe SSH `true`. O holder supervisiona
+o bubblewrap, e `--die-with-parent` encerra a sandbox após morte abrupta.
 
-```text
-profile=default
-policy_version=1
-```
+Antes de sinalizar um holder, `stop` valida PID, start-time de `/proc`, argv,
+workspace, session dir e policy digest. Em seguida envia `SIGTERM`, aguarda e
+usa `SIGKILL` apenas se necessário. Estado stale é recuperado na próxima
+execução.
 
-O layout é:
-
-```text
-$XDG_RUNTIME_DIR/native-lab/<session-id>/
-├── start.lock
-├── holder.pid
-├── session.info
-├── daemon.log
-└── control/
-    ├── lab-ssh.sock
-    ├── client_ed25519
-    ├── client_ed25519.pub
-    ├── ssh_host_ed25519_key
-    ├── ssh_host_ed25519_key.pub
-    ├── authorized_keys
-    ├── known_hosts
-    ├── sshd_config
-    ├── sshd-inetd.sh
-    └── user
-```
-
-Diretórios usam modo `0700`; socket, chaves privadas e arquivos sensíveis usam
-`0600`. O comprimento do socket é validado contra o limite Linux de 107 bytes.
-
-As chaves são efêmeras e desaparecem quando o runtime do usuário é limpo. Elas
-não devem ser copiadas, compartilhadas ou versionadas.
-
-## Lifecycle
-
-### Startup
-
-1. O cliente calcula a sessão pelo workspace.
-2. Um probe SSH verifica se ela já está operacional.
-3. `flock` serializa startups concorrentes.
-4. O probe é repetido dentro do lock.
-5. Estado stale é removido e `native-labd` é iniciado com `nohup`.
-6. O cliente espera até cinco segundos pelo SSH funcional.
-7. Com a sessão pronta, o cliente libera o lock e faz `exec ssh`.
-
-O PID sozinho não declara prontidão. A autoridade é uma autenticação SSH real
-executando `true`.
-
-### Holder
-
-`native-labd` é um supervisor mínimo. Ele inicia o bubblewrap como filho com
-`--die-with-parent` e encaminha encerramento normal. Isso evita deixar o
-sandbox órfão quando o holder sofre `SIGKILL`, sem atrelar sua vida ao cliente
-`ssh` que iniciou a sessão.
-
-### Stop
-
-`native-lab stop`:
-
-1. adquire o mesmo lock usado pelo startup;
-2. valida PID, start-time de `/proc`, caminho do daemon, workspace e sessão;
-3. envia `SIGTERM`;
-4. espera dois segundos;
-5. usa `SIGKILL` se necessário;
-6. remove socket, chaves e metadados stale.
-
-O lock e o último `daemon.log` são preservados. Nunca é executado um
-`kill "$(cat holder.pid)"` sem validação.
-
-## SSH interno
-
-O listener persistente é conceitualmente:
-
-```text
-caller
-  ↕
-ssh -T
-  ↕
-socat / Unix socket
-  ↕
-sshd -i
-  ↕
-COMMAND
-```
-
-O sshd aceita somente a chave pública da sessão. Password, PAM, TTY, X11,
-agent forwarding, TCP forwarding, Unix forwarding, tunnels, user environment e
-user RC estão desabilitados.
-
-O socat não usa sua opção `stderr` no endereço `EXEC`. Isso é intencional:
-diagnósticos do sshd precisam permanecer no log, fora do byte stream SSH.
+O control plane continua intencionalmente simples. Cliente e sandbox ainda
+enxergam as chaves efêmeras no diretório compartilhado; separar material
+host-private, shared e sandbox-private é hardening futuro.
 
 ## Testes
 
-O smoke test precisa ser executado num host que permita user e network
-namespaces. Sandboxes externos com seccomp podem bloquear netlink ou criação de
-sockets e produzir `EPERM` antes que o PoC seja iniciado.
+Os testes precisam rodar num host que permita user/network namespaces; um
+sandbox externo pode retornar `EPERM` antes do NativeLab começar.
 
 ```bash
 ./native-lab-smoke.sh
+./native-lab-policy-smoke.sh
 ```
 
-O teste usa um `$XDG_RUNTIME_DIR` temporário sob `/tmp` e valida:
+O primeiro cobre lifecycle, concorrência, namespaces, localhost, ausência de
+Internet, streaming, stdio, exit status, quoting e recuperação stale. O segundo
+cria configs Codex/NativeLab e projetos temporários para cobrir RW/RO, secrets,
+metadata, HOME/runtime/shm privados, npm RO, trusted/untrusted, digest e TCB.
 
-- startup concorrente;
-- permissões de runtime, socket e chaves;
-- namespaces e capabilities;
-- fronteira read-only e workspace read-write;
-- isolamento do `/run`;
-- localhost interno e separação do localhost do host;
-- ausência de Internet;
-- streaming, stdin, stdout e stderr;
-- exit status e quoting de argv;
-- PATH para npm;
-- recuperação após morte abrupta;
-- `status` e `stop` idempotente.
+O smoke de policy cria dois arquivos-probe com nome único em `~/.npm-global` e
+`~/.npm` para comprovar os mounts default e os remove no cleanup. Se os
+diretórios não existirem, ele os cria e depois tenta removê-los somente se
+continuarem vazios.
 
-O runtime temporário é removido ao final.
+O workflow GitHub Actions roda ambos em `ubuntu-24.04`, instala as dependências,
+habilita user namespaces na VM efêmera, valida Bash/Python/ShellCheck, modos
+executáveis e ausência de runtime/chaves privadas versionados. O relaxamento de
+AppArmor no runner descartável não é recomendação para uma máquina real.
 
-### GitHub Actions
+## O que entra no Git
 
-O workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) executa em um
-runner GitHub-hosted `ubuntu-24.04` para pushes, pull requests e disparos
-manuais. Ele:
-
-- instala bubblewrap, socat, OpenSSH, ShellCheck e as demais dependências;
-- valida os modos executáveis e a sintaxe Bash;
-- executa ShellCheck;
-- impede que `run/` ou chaves privadas OpenSSH sejam versionados;
-- executa o smoke test completo com timeout de 120 segundos.
-
-Ubuntu 24.04 pode restringir user namespaces sem privilégio por AppArmor. Como
-o runner GitHub-hosted é uma VM descartável, o workflow desativa essa restrição
-externa somente durante o job. Isso permite testar o bubblewrap como o usuário
-normal do runner; não significa que o native-lab contorne essa política num host
-real, nem é uma recomendação para desativá-la permanentemente em uma máquina de
-desenvolvimento.
-
-O job inteiro possui timeout de dez minutos e permissões GitHub limitadas a
-leitura do conteúdo do repositório.
+Devem ser versionados os quatro executáveis/helper, smoke tests, documentação,
+`.gitignore` e `.github/workflows/ci.yml`. Não devem entrar sockets, logs,
+chaves SSH, `resolved-policy.json`, runtimes, fixtures temporárias ou
+`__pycache__`. O `.gitignore` cobre os artefatos locais conhecidos e o CI
+rejeita runtime antigo e private keys rastreadas.
 
 ## Diagnóstico
 
-Confira o estado no mesmo workspace:
-
 ```bash
-./native-lab status
+native-lab status
 ```
 
-Em falha de startup, o cliente mostra até as primeiras 200 linhas de
-`daemon.log`. O caminho completo do runtime também aparece em `status`.
+Falhas de startup exibem as primeiras linhas de `daemon.log`. Erros comuns:
 
-Erros comuns:
+- `XDG_RUNTIME_DIR is not set`: runtime do usuário indisponível;
+- `missing dependency`: falta uma ferramenta host-side;
+- `Operation not permitted`: kernel, LSM ou sandbox externo bloqueou namespaces;
+- `failed to resolve filesystem policy`: config inválido, path inseguro, erro
+  no scan ou mask que não pode ser construído fail-closed;
+- `Read-only file system`/`Permission denied`: escrita fora dos roots permitidos;
+- socket longo demais: use um runtime com pathname menor.
 
-- `XDG_RUNTIME_DIR is not set`: a variável não está disponível na sessão atual;
-- `session failed to become ready`: consulte o `daemon.log` exibido;
-- `missing dependency`: instale a ferramenta indicada;
-- caminho do socket longo demais: use um `$XDG_RUNTIME_DIR` mais curto;
-- `Operation not permitted`: user namespaces, net namespaces, LSM ou seccomp do
-  ambiente externo bloquearam o bubblewrap;
-- `Read-only file system`: a ferramenta tentou escrever fora do workspace,
-  `/tmp` ou `/run/native-lab-control`.
+Os probes e comandos que fundamentaram as decisões estão em
+[DISCOVERIES.md](DISCOVERIES.md).
 
 ## Fora de escopo
 
-Esta versão não implementa:
-
-- protocolo próprio de execução;
-- tmux;
-- cgroups ou quotas;
-- pidfd;
-- seccomp customizado;
-- proxy MCP;
-- Xvfb, Wayland ou acesso a display do host;
-- integração com Docker;
-- código C/C++;
-- profiles configuráveis de capabilities.
-
-GDB/ptrace exigirá uma policy futura específica. Dependendo do alvo, UID, Yama
-e seccomp, ptrace pode funcionar sem `CAP_SYS_PTRACE` ou exigir permissões
-adicionais. Qualquer alteração deve criar uma nova `policy_version`, evitando
-reutilizar uma sessão criada sob regras antigas.
-
-## Documentação dos experimentos
-
-Os comandos utilizados para validar mounts, loopback, capabilities, SSH sobre
-UDS e encerramento do holder estão registrados em [DISCOVERIES.md](DISCOVERIES.md).
-
-## Estado do projeto
-
-**PoC experimental. Não usar em produção e não executar código não confiável.**
-
-Antes de evoluir para uma ferramenta de segurança seria necessário definir um
-threat model, ocultar segredos do host em vez de apenas torná-los read-only,
-adicionar políticas de syscall e recursos, endurecer o canal de controle e
-submeter a implementação a revisão especializada.
+Não há protocolo daemon próprio, tmux, C/C++, cgroups, proxy de Internet, proxy
+MCP, Xvfb integrado, acesso ao display do host, Docker, pidfd, seccomp próprio
+ou profiles de capabilities. Antes de qualquer uso como ferramenta de
+segurança são necessários threat model formal, revisão especializada, testes
+adversariais e hardening adicional.

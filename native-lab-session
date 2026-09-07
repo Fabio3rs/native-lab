@@ -1,10 +1,17 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
 umask 077
 
+readonly HOST_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PATH=$HOST_PATH
+export PATH
+
 readonly CONTROL_DIR=/run/native-lab-control
 readonly SOCK="$CONTROL_DIR/lab-ssh.sock"
+readonly MOUNTS_READY="$CONTROL_DIR/.mounts-ready"
+readonly MOUNTS_RELEASE="$CONTROL_DIR/.mounts-release"
+readonly MOUNT_RELEASE_TIMEOUT_SECONDS=5
 
 die() {
     printf 'native-lab-session: %s\n' "$*" >&2
@@ -22,6 +29,19 @@ need readlink
 
 [[ -d "$CONTROL_DIR" && ! -L "$CONTROL_DIR" ]] || die "invalid control directory: $CONTROL_DIR"
 chmod 700 "$CONTROL_DIR"
+
+printf '%s\n' "$$" >"$MOUNTS_READY"
+chmod 600 "$MOUNTS_READY"
+deadline=$((SECONDS + MOUNT_RELEASE_TIMEOUT_SECONDS))
+while [[ ! -e "$MOUNTS_RELEASE" ]] && (( SECONDS < deadline )); do
+    sleep 0.05
+done
+[[ -f "$MOUNTS_RELEASE" && ! -L "$MOUNTS_RELEASE" ]] ||
+    die 'daemon did not release mount setup before timeout'
+rm -f -- "$MOUNTS_READY" "$MOUNTS_RELEASE"
+
+mkdir -p /run/sshd
+chmod 755 /run/sshd
 
 SSHD_BIN=$(command -v sshd)
 HOST_KEY="$CONTROL_DIR/ssh_host_ed25519_key"
