@@ -85,6 +85,9 @@ cap_eff=$("$NATIVE_LAB" run sh -c "awk '/CapEff/ {print \$2}' /proc/self/status"
 [[ "$cap_eff" == 0000000000000000 ]] || fail "effective capabilities are not empty: $cap_eff"
 pass 'policy 1 drops all effective capabilities'
 
+# Variables and substitutions in this string intentionally belong to the
+# remote shell inside native-lab.
+# shellcheck disable=SC2016
 "$NATIVE_LAB" run sh -c '
     test ! -e "/run/user/$(id -u)/bus"
     test ! -e /tmp/.X11-unix
@@ -93,6 +96,9 @@ pass 'policy 1 drops all effective capabilities'
 ' || fail '/run exposes more than the control directory'
 pass '/run and host desktop sockets are private'
 
+# Variables and substitutions in this string intentionally belong to the
+# remote shell inside native-lab.
+# shellcheck disable=SC2016
 "$NATIVE_LAB" run sh -c '
     workspace_probe="$PWD/.native-lab-write-probe.$$"
     : >"$workspace_probe"
@@ -176,6 +182,8 @@ pass 'stdout streams before process exit'
 
 stdio_out="$TEST_RUNTIME/stdio.out"
 stdio_err="$TEST_RUNTIME/stdio.err"
+# $line is intentionally expanded by the remote shell.
+# shellcheck disable=SC2016
 printf 'hello-through-stdin\n' | "$NATIVE_LAB" run sh -c \
     'IFS= read -r line; printf "stdout:%s\n" "$line"; printf "stderr:separate\n" >&2' \
     >"$stdio_out" 2>"$stdio_err"
@@ -192,7 +200,7 @@ pass 'remote exit status is preserved'
 
 quoted=$("$NATIVE_LAB" run python3 -c \
     'import sys; print("|".join(value.encode().hex() for value in sys.argv[1:]))' \
-    '' 'a b' "single'quote" '$HOME' '*' $'line\nbreak')
+    '' 'a b' "single'quote" "\$HOME" '*' $'line\nbreak')
 expected='|612062|73696e676c652771756f7465|24484f4d45|2a|6c696e650a627265616b'
 [[ "$quoted" == "$expected" ]] || fail "argv quoting mismatch: $quoted"
 pass 'remote argv preserves empty and metacharacter-containing arguments'

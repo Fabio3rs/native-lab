@@ -264,7 +264,9 @@ ensure_session() {
     fi
     start_session
     if ! wait_session_ready; then
-        holder_matches && terminate_holder || true
+        if holder_matches; then
+            terminate_holder || true
+        fi
         cleanup_stale_state
         release_lock
         printf 'native-lab: session failed to become ready\n' >&2

@@ -79,6 +79,8 @@ SHELL_VALUE=${SHELL:-/bin/sh}
 LANG_VALUE=${LANG:-C.UTF-8}
 
 BWRAP_PID=
+# Callback invoked indirectly by trap.
+# shellcheck disable=SC2317
 shutdown() {
     local status=$?
     trap - EXIT INT TERM HUP
