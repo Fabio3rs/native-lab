@@ -530,12 +530,72 @@ Changing this file changes the policy digest and creates a session with the
 new policy; an old session that is already running does not receive the mount
 retroactively.
 
-### Instructing the agent until generic MCP execution exists
+### Generic MCP server
 
-Today, the MCP configuration above provides Playwright tools, but it is not a
-generic protocol for executing any command inside the session. Until that
-interface exists, instruct the agent to prefix development and test processes
-with `native-lab run`. For example, add this to `AGENTS.md` or the prompt:
+The Python adapter exposes asynchronous process management without invoking a
+host shell:
+
+| Tool | Operation |
+| --- | --- |
+| `run` | starts structured `argv` and immediately returns a `process_id` |
+| `head` / `tail` | queries the bounded stdout/stderr ring buffer |
+| `expect` | waits for future or retained literal output without polling |
+| `write` | writes UTF-8 to stdin and can send EOF |
+| `kill` | signals the SSH client group (`TERM`, or `KILL` with `force`) |
+| `processes` | lists handles owned by this MCP server instance |
+
+Create the environment and install the repository lock file:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.lock
+```
+
+A Codex configuration using absolute paths looks like this:
+
+```toml
+[mcp_servers.native_lab]
+command = "/path/to/native-lab/.venv/bin/python"
+args = ["/path/to/native-lab/native-lab-mcp"]
+env_vars = ["XDG_RUNTIME_DIR"]
+startup_timeout_sec = 20.0
+tool_timeout_sec = 3600.0
+```
+
+The server must start with the agent workspace as its current directory. It
+uses that directory to select the NativeLab session; `NATIVE_LAB_BIN` may point
+to another trusted launcher. Each process runs as:
+
+```text
+native-lab run -- argv[0] argv[1] ...
+```
+
+`expect` performs literal matching, including across read boundaries.
+`from_position="now"` is the default and observes only new events;
+`from_position="start"` searches retained history. `after_cursor` resumes
+precisely after an opaque cursor returned by the tools and takes precedence
+over `from_position`. The default buffer is 1 MiB of characters per process;
+the trusted environment can change it with `NATIVE_LAB_MCP_BUFFER_CHARS`.
+Each buffer also retains at most 4096 events. An instance retains up to 64
+handles by default; at the limit, the oldest completed handle is discarded,
+but concurrent processes are never removed. The trusted environment can change
+the quota with `NATIVE_LAB_MCP_MAX_PROCESSES`.
+
+`mcp-types` 2.2.0 still contains types-only models for the old 2025 Tasks, but
+the official SDK does not implement the wire-incompatible 2026 Tasks
+extension. This first adapter therefore keeps `expect` as a blocking,
+cancellable call with a timeout. The registry has no MCP dependency, so a
+future Tasks extension can wrap the same wait without changing processes,
+buffers, or cursors.
+
+Processes belong to the MCP instance lifetime. On shutdown, the adapter sends
+`SIGTERM` to active groups and uses `SIGKILL` after a grace period.
+
+### Instructing the agent without the generic MCP server
+
+When the adapter above is not configured, instruct the agent to prefix
+development and test processes with `native-lab run`. For example, add this to
+`AGENTS.md` or the prompt:
 
 ```text
 Run project code, servers, and tests inside NativeLab. For one process, pass
@@ -648,9 +708,7 @@ hardening.
 
 ## Roadmap
 
-- provide an MCP server/protocol through which the agent can request arbitrary
-  command execution inside the NativeLab session through structured argv,
-  without depending on textual instructions to call `native-lab run` or on
-  interpretation by the host shell;
+- integrate `expect` with MCP Tasks when the official SDK provides the
+  corresponding server-side lifecycle;
 - keep any expansion of filesystem, networking, or capabilities under the
   host's trusted policy control.

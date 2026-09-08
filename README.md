@@ -526,12 +526,73 @@ extra_read_only = [
 Alterar esse arquivo muda o policy digest e cria uma sessão com a nova policy;
 uma sessão antiga já em execução não recebe o mount retroativamente.
 
-### Orientar o agente enquanto não há execução MCP genérica
+### Servidor MCP genérico
 
-Hoje, o MCP acima oferece as ferramentas do Playwright, mas não é um protocolo
-genérico para executar qualquer comando dentro da sessão. Até essa interface
-existir, instrua o agente a prefixar processos de desenvolvimento e teste com
-`native-lab run`. Um exemplo de orientação para `AGENTS.md` ou para o prompt:
+O adapter Python expõe gerenciamento assíncrono de processos sem interpretar
+shell no host:
+
+| Tool | Operação |
+| --- | --- |
+| `run` | inicia um `argv` estruturado e devolve `process_id` imediatamente |
+| `head` / `tail` | consulta o ring buffer limitado de stdout/stderr |
+| `expect` | espera output literal futuro ou histórico sem polling |
+| `write` | escreve UTF-8 no stdin e pode enviar EOF |
+| `kill` | sinaliza o grupo do cliente SSH (`TERM`, ou `KILL` com `force`) |
+| `processes` | lista os handles pertencentes à instância do servidor MCP |
+
+Crie o ambiente e instale o lock preparado no repositório:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.lock
+```
+
+Uma configuração Codex usando paths absolutos fica assim:
+
+```toml
+[mcp_servers.native_lab]
+command = "/caminho/para/native-lab/.venv/bin/python"
+args = ["/caminho/para/native-lab/native-lab-mcp"]
+env_vars = ["XDG_RUNTIME_DIR"]
+startup_timeout_sec = 20.0
+tool_timeout_sec = 3600.0
+```
+
+O servidor deve ser iniciado com o workspace do agente como diretório atual.
+Ele usa esse diretório para selecionar a sessão NativeLab; `NATIVE_LAB_BIN`
+pode apontar para outro launcher confiável. Cada processo é executado como:
+
+```text
+native-lab run -- argv[0] argv[1] ...
+```
+
+O `expect` faz matching literal, inclusive através de boundaries das leituras.
+`from_position="now"` é o default e observa somente eventos novos;
+`from_position="start"` pesquisa o histórico ainda retido. `after_cursor`
+retoma precisamente depois de um cursor opaco devolvido pelas tools e tem
+precedência sobre `from_position`. O buffer default é de 1 MiB de caracteres
+por processo e pode ser alterado no ambiente confiável com
+`NATIVE_LAB_MCP_BUFFER_CHARS`. Cada buffer também retém no máximo 4096 eventos.
+Uma instância retém até 64 handles por default; ao atingir a cota, o handle
+encerrado mais antigo é descartado, mas processos concorrentes nunca são
+removidos. O ambiente confiável pode alterar a cota com
+`NATIVE_LAB_MCP_MAX_PROCESSES`.
+
+O `mcp-types` 2.2.0 ainda contém modelos *types-only* das Tasks antigas de
+2025, mas o SDK oficial não implementa a extensão Tasks wire-incompatível de
+2026. Por isso este primeiro adapter mantém `expect` como uma chamada
+bloqueante, cancelável e com timeout. O registry não depende do MCP, então uma
+extensão Tasks futura pode envolver a mesma espera sem alterar processos,
+buffers ou cursores.
+
+Os processos pertencem à vida da instância MCP. Quando ela encerra, o adapter
+envia `SIGTERM` aos grupos ainda ativos e usa `SIGKILL` após um grace period.
+
+### Orientar o agente sem o MCP genérico
+
+Quando o adapter acima não estiver configurado, instrua o agente a prefixar
+processos de desenvolvimento e teste com `native-lab run`. Um exemplo de
+orientação para `AGENTS.md` ou para o prompt:
 
 ```text
 Execute código do projeto, servidores e testes dentro do NativeLab. Para um
@@ -642,9 +703,7 @@ adversariais e hardening adicional.
 
 ## Roadmap
 
-- oferecer um servidor/protocolo MCP para o agente solicitar a execução de
-  comandos arbitrários dentro da sessão NativeLab por argv estruturado, sem
-  depender de instruções textuais para chamar `native-lab run` nem da
-  interpretação do shell do host;
+- integrar `expect` à extensão MCP Tasks quando o SDK oficial oferecer o
+  lifecycle server-side correspondente;
 - manter qualquer ampliação de filesystem, rede ou capabilities sob controle
   da policy confiável do host.

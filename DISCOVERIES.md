@@ -185,6 +185,31 @@ Antes de sinalizar o supervisor, a implementação valida PID, start-time de
 `/proc`, caminho de `native-labd` e diretório da sessão nos argumentos do
 processo, evitando atingir um PID reutilizado.
 
+## Adapter MCP e espera por output
+
+A `.venv` do PoC foi validada com `mcp==2.2.0`. O SDK high-level registra as
+tools estruturadas e o transporte stdio protege o FD do protocolo, mas a
+extensão Tasks de 2026 ainda consta como não implementada no roadmap oficial.
+Os símbolos `Task*` presentes em `mcp-types` são modelos *types-only* das Tasks
+core de 2025 e não registram handlers como `tasks/get` no servidor.
+
+Por isso `expect` começa como uma chamada bloqueante com timeout. Seu núcleo é
+um `asyncio.Condition` sobre o ring buffer, independente do MCP, e pode ser
+envolvido por uma implementação futura de Tasks sem mudar a semântica. O
+matcher literal foi verificado com o padrão dividido entre duas leituras do
+pipe e com retomada por cursor dentro de um único evento.
+
+O smoke ponta a ponta usou o cliente oficial sobre stdio para iniciar:
+
+```text
+sh -c 'sleep 0.3; printf "ready in 183 ms\n"; sleep 30'
+```
+
+`run` devolveu imediatamente um `process_id`; `expect("ready in")` encontrou a
+linha em stdout; `tail` devolveu o mesmo evento; e `kill` sinalizou o grupo do
+cliente SSH. O workload foi executado pelo `native-lab run -- ...`, não
+diretamente no host.
+
 ## Reprodução consolidada
 
 O teste automatizado reúne as verificações funcionais:
