@@ -540,6 +540,7 @@ host shell:
 | `run` | starts structured `argv` and immediately returns a `process_id` |
 | `head` / `tail` | queries the bounded stdout/stderr ring buffer |
 | `expect` | waits for future or retained literal output without polling |
+| `wait` | waits for process exit or timeout, with an optional output tail |
 | `write` | writes UTF-8 to stdin and can send EOF |
 | `kill` | signals the SSH client group (`TERM`, or `KILL` with `force`) |
 | `processes` | lists handles owned by this MCP server instance |
@@ -580,6 +581,11 @@ Each buffer also retains at most 4096 events. An instance retains up to 64
 handles by default; at the limit, the oldest completed handle is discarded,
 but concurrent processes are never removed. The trusted environment can change
 the quota with `NATIVE_LAB_MCP_MAX_PROCESSES`.
+
+`wait(process_id, timeout_seconds, tail_lines=0, stream="both")` waits for the
+process to exit without terminating it when the timeout expires. `tail_lines`
+may request from 1 through 100 final buffered lines, including on timeout;
+`stream` selects `stdout`, `stderr`, or both.
 
 `mcp-types` 2.2.0 still contains types-only models for the old 2025 Tasks, but
 the official SDK does not implement the wire-incompatible 2026 Tasks

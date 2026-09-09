@@ -29,6 +29,7 @@ MAX_WRITE_CHARS = 1024 * 1024
 MAX_ARGV_CHARS = 1024 * 1024
 MAX_BUFFER_CHARS = 64 * 1024 * 1024
 MAX_BUFFER_EVENTS = 4096
+MAX_TAIL_LINES = 100
 
 
 class NativeLabError(RuntimeError):
@@ -270,6 +271,47 @@ class ProcessRegistry:
                     "exit_code": managed.exit_code,
                 }
 
+    async def wait(
+        self,
+        process_id: str,
+        timeout_seconds: float,
+        *,
+        tail_lines: int = 0,
+        stream: StreamSelection = "both",
+    ) -> dict[str, object]:
+        managed = self._get(process_id)
+        self._validate_stream(stream)
+        if timeout_seconds < 0 or timeout_seconds > 3600:
+            raise NativeLabError("timeout_seconds must be between 0 and 3600")
+        if tail_lines < 0 or tail_lines > MAX_TAIL_LINES:
+            raise NativeLabError(f"tail_lines must be between 0 and {MAX_TAIL_LINES}")
+
+        async with managed.condition:
+            reason = "process_exited"
+            if managed.exit_code is None:
+                try:
+                    async with asyncio.timeout(timeout_seconds):
+                        while managed.exit_code is None:
+                            await managed.condition.wait()
+                except TimeoutError:
+                    reason = "process_exited" if managed.exit_code is not None else "timeout"
+
+            events, result_truncated = self._select_tail_lines(
+                list(managed.events), stream, tail_lines
+            )
+            return {
+                "process_id": managed.process_id,
+                "reason": reason,
+                "stream": stream,
+                "tail_lines": tail_lines,
+                "events": [event.as_dict() for event in events],
+                "cursor": managed.cursor,
+                "history_truncated": managed.history_truncated,
+                "result_truncated": result_truncated,
+                "state": managed.state,
+                "exit_code": managed.exit_code,
+            }
+
     async def write(self, process_id: str, data: str = "", eof: bool = False) -> dict[str, object]:
         managed = self._get(process_id)
         if len(data) > MAX_WRITE_CHARS:
@@ -427,6 +469,36 @@ class ProcessRegistry:
                 break
         result.reverse()
         return result
+
+    @classmethod
+    def _select_tail_lines(
+        cls, events: list[OutputEvent], stream: StreamSelection, limit: int
+    ) -> tuple[list[OutputEvent], bool]:
+        eligible = [event for event in events if cls._matches_stream(event, stream)]
+        combined = "".join(event.text for event in eligible)
+        lines = combined.splitlines(keepends=True)
+        result_truncated = len(lines) > limit
+        if limit == 0 or not lines:
+            return [], result_truncated
+
+        cutoff = len(combined) - sum(len(line) for line in lines[-limit:])
+        result: list[OutputEvent] = []
+        offset = 0
+        for event in eligible:
+            event_end = offset + len(event.text)
+            if event_end > cutoff:
+                text_offset = max(0, cutoff - offset)
+                text = event.text[text_offset:]
+                result.append(
+                    OutputEvent(
+                        event.start_cursor + text_offset,
+                        event.cursor,
+                        event.stream,
+                        text,
+                    )
+                )
+            offset = event_end
+        return result, result_truncated
 
     @classmethod
     def _output_result(

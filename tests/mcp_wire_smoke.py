@@ -11,7 +11,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 
 ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_TOOLS = {"run", "head", "tail", "expect", "write", "kill", "processes"}
+EXPECTED_TOOLS = {"run", "head", "tail", "expect", "wait", "write", "kill", "processes"}
 
 
 async def smoke() -> None:

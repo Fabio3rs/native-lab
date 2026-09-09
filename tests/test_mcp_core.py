@@ -95,6 +95,83 @@ class ProcessRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["history_truncated"])
         self.assertTrue(result["result_truncated"])
 
+    async def test_wait_returns_exit_and_requested_tail_lines(self) -> None:
+        script = (
+            "import os,time; os.write(1,b'first\\npar'); time.sleep(.05); "
+            "os.write(1,b'tial\\nlast')"
+        )
+        started = await self.registry.run([sys.executable, "-c", script])
+        result = await self.registry.wait(
+            str(started["process_id"]), 1, tail_lines=2, stream="stdout"
+        )
+        text = "".join(str(event["text"]) for event in result["events"])
+        self.assertEqual(result["reason"], "process_exited")
+        self.assertEqual(result["state"], "exited")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(text, "partial\nlast")
+        self.assertTrue(result["result_truncated"])
+
+    async def test_wait_timeout_keeps_process_running_and_includes_tail(self) -> None:
+        script = "import os,time; os.write(2,b'ready\\n'); time.sleep(30)"
+        started = await self.registry.run([sys.executable, "-c", script])
+        process_id = str(started["process_id"])
+        await self.registry.expect(
+            process_id, "ready", stream="stderr", from_position="start", timeout_seconds=1
+        )
+        result = await self.registry.wait(
+            process_id, 0.01, tail_lines=1, stream="stderr"
+        )
+        text = "".join(str(event["text"]) for event in result["events"])
+        self.assertEqual(result["reason"], "timeout")
+        self.assertEqual(result["state"], "running")
+        self.assertIsNone(result["exit_code"])
+        self.assertEqual(text, "ready\n")
+
+        await self.registry.kill(process_id)
+        exited = await self.registry.wait(process_id, 1)
+        self.assertEqual(exited["reason"], "process_exited")
+
+    async def test_wait_defaults_to_no_output_and_filters_streams(self) -> None:
+        script = "import os; os.write(1,b'out\\n'); os.write(2,b'err\\n')"
+        started = await self.registry.run([sys.executable, "-c", script])
+        process_id = str(started["process_id"])
+        no_output = await self.registry.wait(process_id, 1)
+        self.assertEqual(no_output["events"], [])
+
+        stderr = await self.registry.wait(process_id, 0, tail_lines=1, stream="stderr")
+        text = "".join(str(event["text"]) for event in stderr["events"])
+        self.assertEqual(text, "err\n")
+
+        both = await self.registry.wait(process_id, 0, tail_lines=100)
+        streams = {event["stream"] for event in both["events"]}
+        self.assertEqual(streams, {"stdout", "stderr"})
+
+    async def test_wait_accepts_one_hundred_tail_lines(self) -> None:
+        script = "import sys; sys.stdout.write(''.join(f'{n}\\n' for n in range(101)))"
+        started = await self.registry.run([sys.executable, "-c", script])
+        result = await self.registry.wait(
+            str(started["process_id"]), 1, tail_lines=100, stream="stdout"
+        )
+        text = "".join(str(event["text"]) for event in result["events"])
+        self.assertEqual(len(text.splitlines()), 100)
+        self.assertEqual(text.splitlines()[0], "1")
+        self.assertEqual(text.splitlines()[-1], "100")
+        self.assertTrue(result["result_truncated"])
+
+    async def test_wait_validates_timeout_tail_lines_and_process_id(self) -> None:
+        started = await self.registry.run([sys.executable, "-c", "pass"])
+        process_id = str(started["process_id"])
+        with self.assertRaises(NativeLabError):
+            await self.registry.wait(process_id, -1)
+        with self.assertRaises(NativeLabError):
+            await self.registry.wait(process_id, 3601)
+        with self.assertRaises(NativeLabError):
+            await self.registry.wait(process_id, 0, tail_lines=-1)
+        with self.assertRaises(NativeLabError):
+            await self.registry.wait(process_id, 0, tail_lines=101)
+        with self.assertRaises(NativeLabError):
+            await self.registry.wait("missing", 0)
+
     async def test_kill_terminates_process(self) -> None:
         started = await self.registry.run([sys.executable, "-c", "import time; time.sleep(30)"])
         process_id = str(started["process_id"])
@@ -149,7 +226,9 @@ class ServerSchemaTests(unittest.TestCase):
         from native_lab_mcp.server import mcp
 
         names = {tool.name for tool in mcp._tool_manager.list_tools()}
-        self.assertEqual(names, {"run", "head", "tail", "expect", "write", "kill", "processes"})
+        self.assertEqual(
+            names, {"run", "head", "tail", "expect", "wait", "write", "kill", "processes"}
+        )
 
     def test_expect_schema_uses_unambiguous_from_position(self) -> None:
         from native_lab_mcp.server import mcp
@@ -159,6 +238,16 @@ class ServerSchemaTests(unittest.TestCase):
         properties = tool.parameters["properties"]
         self.assertIn("from_position", properties)
         self.assertEqual(properties["from_position"]["default"], "now")
+
+    def test_wait_schema_requires_timeout_and_exposes_tail_options(self) -> None:
+        from native_lab_mcp.server import mcp
+
+        tool = mcp._tool_manager.get_tool("wait")
+        assert tool is not None
+        properties = tool.parameters["properties"]
+        self.assertEqual(set(tool.parameters["required"]), {"process_id", "timeout_seconds"})
+        self.assertEqual(properties["tail_lines"]["default"], 0)
+        self.assertEqual(properties["stream"]["default"], "both")
 
 
 if __name__ == "__main__":

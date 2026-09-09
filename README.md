@@ -536,6 +536,7 @@ shell no host:
 | `run` | inicia um `argv` estruturado e devolve `process_id` imediatamente |
 | `head` / `tail` | consulta o ring buffer limitado de stdout/stderr |
 | `expect` | espera output literal futuro ou histórico sem polling |
+| `wait` | espera o processo terminar ou o timeout expirar, com tail opcional |
 | `write` | escreve UTF-8 no stdin e pode enviar EOF |
 | `kill` | sinaliza o grupo do cliente SSH (`TERM`, ou `KILL` com `force`) |
 | `processes` | lista os handles pertencentes à instância do servidor MCP |
@@ -577,6 +578,11 @@ Uma instância retém até 64 handles por default; ao atingir a cota, o handle
 encerrado mais antigo é descartado, mas processos concorrentes nunca são
 removidos. O ambiente confiável pode alterar a cota com
 `NATIVE_LAB_MCP_MAX_PROCESSES`.
+
+O `wait(process_id, timeout_seconds, tail_lines=0, stream="both")` aguarda o
+processo terminar sem encerrá-lo quando o timeout expira. `tail_lines` pode
+pedir de 1 a 100 linhas finais do buffer, inclusive em respostas de timeout;
+`stream` seleciona `stdout`, `stderr` ou ambos.
 
 O `mcp-types` 2.2.0 ainda contém modelos *types-only* das Tasks antigas de
 2025, mas o SDK oficial não implementa a extensão Tasks wire-incompatível de

@@ -46,9 +46,9 @@ mcp = MCPServer(
     "native-lab",
     description="Run and observe development workloads inside a persistent NativeLab sandbox.",
     instructions=(
-        "Use run with structured argv. Use expect to wait for meaningful output instead of repeatedly "
-        "polling tail. Commands from this server share the NativeLab session and private localhost for "
-        "the workspace in which the server was started."
+        "Use run with structured argv. Use wait for process completion and expect for meaningful "
+        "output instead of repeatedly polling tail. Commands from this server share the NativeLab "
+        "session and private localhost for the workspace in which the server was started."
     ),
     version="0.1.0",
     lifespan=lifespan,
@@ -124,6 +124,29 @@ async def expect(
             after_cursor=after_cursor,
             timeout_seconds=timeout_seconds,
             context_lines=context_lines,
+        )
+    )
+
+
+@mcp.tool()
+async def wait(
+    process_id: str,
+    timeout_seconds: float,
+    ctx: Context[AppState],
+    tail_lines: int = 0,
+    stream: Literal["stdout", "stderr", "both"] = "both",
+) -> dict[str, object]:
+    """Wait for a process to exit or for the timeout to expire.
+
+    A timeout leaves the process running. Set tail_lines from 1 through 100 to
+    include a final output snapshot, optionally filtered by stream.
+    """
+    return await _call(
+        _registry(ctx).wait(
+            process_id,
+            timeout_seconds,
+            tail_lines=tail_lines,
+            stream=stream,
         )
     )
 
