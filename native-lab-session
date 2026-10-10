@@ -30,6 +30,8 @@ need readlink
 [[ -d "$CONTROL_DIR" && ! -L "$CONTROL_DIR" ]] || die "invalid control directory: $CONTROL_DIR"
 chmod 700 "$CONTROL_DIR"
 
+python3 -I /run/native-lab-bootstrap/native-lab-policy.py validate-gpu \
+    --policy /run/native-lab-bootstrap/resolved-policy.json
 printf '%s\n' "$$" >"$MOUNTS_READY"
 chmod 600 "$MOUNTS_READY"
 deadline=$((SECONDS + MOUNT_RELEASE_TIMEOUT_SECONDS))

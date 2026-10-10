@@ -71,7 +71,8 @@ cleanup() {
     local status=$?
     trap - EXIT INT TERM HUP
     set +e
-    in_current stop >/dev/null 2>&1
+    in_current stop --all >/dev/null 2>&1
+    (cd "$UNTRUSTED" && "$NATIVE_LAB" stop --all) >/dev/null 2>&1
     rm -f -- "$NPM_EXEC" "$NPM_CACHE_PROBE"
     (( CREATED_NPM_BIN )) && rmdir -- "$NPM_BIN" 2>/dev/null
     (( CREATED_NPM_GLOBAL )) && rmdir -- "$NPM_GLOBAL" 2>/dev/null
@@ -189,7 +190,7 @@ in_current run sh -c '
     test ! -e /var
     test -z "${NATIVE_LAB_TEST_TOKEN-}"
 ' _ "$TRUSTED" "$UNTRUSTED" "$EXTRA_RO" "$NPM_EXEC" "$NPM_CACHE_PROBE" ||
-    fail 'resolved filesystem policy does not match the v2 contract'
+    fail 'resolved filesystem policy does not preserve the filesystem isolation contract'
 pass 'workspace RW, trusted/extra RO, secret masks and private HOME/runtime work'
 
 grep -q write "$CURRENT/normal.txt" || fail 'workspace normal-file write did not persist'
@@ -253,5 +254,31 @@ chmod 700 "$fake_bin/rg"
 )
 [[ ! -e "$CURRENT/fake-rg-ran" ]] || fail 'host-side policy resolution used workspace PATH'
 pass 'host-side TCB ignores workspace-supplied executables'
+
+in_current run true
+first_session=$(in_current status | awk '/^Session:/ {print $2}')
+write_native_config
+in_current run true
+changed_status=$(in_current status)
+second_session=$(awk '/^Session:/ {print $2}' <<<"$changed_status")
+[[ "$first_session" != "$second_session" ]] || fail 'changed authority reused an old holder'
+grep -Fq "Other session:   $first_session active" <<<"$changed_status" || fail 'old active policy was not reported'
+(cd "$UNTRUSTED" && "$NATIVE_LAB" run true)
+unrelated_holder=$(cd "$UNTRUSTED" && "$NATIVE_LAB" status | awk '/^Holder PID:/ {print $3}')
+unrelated_session=$(cd "$UNTRUSTED" && "$NATIVE_LAB" status | awk '/^Session:/ {print $2}')
+printf 'invalid = [\n' >"$NATIVE_CONFIG"
+if in_current status >"$TEST_RUNTIME/invalid-status" 2>&1; then
+    fail 'invalid config was accepted'
+fi
+grep -Fq "Other session:   $first_session active" "$TEST_RUNTIME/invalid-status" || fail 'invalid config hid old sessions'
+in_current stop --all || fail 'stop --all could not revoke sessions with invalid config'
+write_native_config
+kill -0 "$unrelated_holder" || fail 'stop --all touched another workspace'
+python3 -I "$ROOT/native-lab-policy.py" sessions --runtime-root "$TEST_RUNTIME/native-lab" \
+    --workspace "$UNTRUSTED" --daemon "$ROOT/native-labd" >"$TEST_RUNTIME/surviving-sessions"
+grep -Fq "Other session:   $unrelated_session active" "$TEST_RUNTIME/surviving-sessions" || fail 'unrelated holder identity changed'
+[[ ! -e "$CURRENT/.git" ]] || fail 'multi-session cleanup leaked synthetic metadata'
+in_current stop --all || fail 'stop --all is not idempotent'
+pass 'old policies are reported and safely revoked despite invalid config; other workspace survives'
 
 printf 'All filesystem policy smoke tests passed.\n'

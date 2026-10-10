@@ -94,7 +94,7 @@ pass 'network, mount and PID namespaces are private'
 
 cap_eff=$("$NATIVE_LAB" run sh -c "awk '/CapEff/ {print \$2}' /proc/self/status")
 [[ "$cap_eff" == 0000000000000000 ]] || fail "effective capabilities are not empty: $cap_eff"
-pass 'policy 2 drops all effective capabilities'
+pass 'policy 3 drops all effective capabilities'
 
 # Variables and substitutions in this string intentionally belong to the
 # remote shell inside native-lab.

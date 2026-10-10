@@ -371,3 +371,81 @@ timeout 180 ./native-lab-smoke.sh
 Ambos terminaram com todos os testes passando. O tempo mostrado antes do clique
 de aprovação era espera da interface; a execução começou após o usuário
 autorizar e terminou imediatamente/rapidamente.
+
+
+## GPU AMD por workspace: revisão e experimentos (2026-10-10)
+
+A revisão anterior à implementação confirmou: configuração validada no host em
+`parse_native_config`/`checked_config_path`; manifest canônico e SHA-256 em
+`compile_policy`; argumentos NUL em `emit_bwrap`; `--args` antes de `--clearenv`
+no daemon; resolução antes do session ID; `stop` procurava somente a policy
+corrente; `encode_remote_command` reconstruía o ambiente SSH. Não houve diferença
+material desses pontos em relação à proposta. Nenhuma variável GPU foi necessária;
+assim, não foi introduzido encaminhamento de ambiente nem comandos de configuração.
+Policy 2/manifest 1 passaram a 3/2. Config 1 continua válido sem GPU, config 2
+adiciona autorização explícita por caminho canônico. Manifests antigos servem
+somente para inspeção/revogação; não inicializam novas sessões.
+
+Host: Radeon RX 7900 XTX, PCI `0000:0b:00.0`, vendor `0x1002`, device `0x744c`,
+driver `amdgpu` confirmado por sysfs. Render node naquele boot:
+`/dev/dri/renderD128` (226:128); KFD (235:0). A associação é descoberta, não fixa.
+UID/GID 1000 no host, grupos render 109/video 44; render node com ACL individual
+rw, KFD root:render 0660. Nenhuma permissão ou membership foi alterada.
+Na sessão SSH, UID/GID 1000, mappings `1000 0 1`; vários grupos aparecem como
+65534, mas o acesso efetivo permaneceu válido. `os.open(O_RDWR)` e ioctls reais
+funcionaram. Essa observação não garante permissões em outras instalações;
+o launcher revalida também depois do SSH e recusa workloads se perder acesso.
+
+Mesa/Vulkan em `/usr`, `/lib` e `/etc` já estavam cobertos pelos mounts existentes,
+incluindo ICDs, EGL vendor manifests e drirc. Loader, ICD e implementação são
+componentes distintos: um loader presente não prova driver utilizável.
+Neste host há symlinks de drivers DRI em `/usr/lib` para `/opt/amdgpu` (Mesa
+25.0.0-devel); RADV do sistema é Mesa 25.2.8. ROCm está em `/opt/rocm-6.4.2`,
+sem `/opt/rocm` nem `/opt/rocm/core`; existe também instalação antiga versionada.
+Os testes autorizaram explicitamente os dois roots necessários, sem compartilhar
+`/opt` inteiro ou escolher automaticamente uma instalação. Runtime no workspace
+continua permitido. Instalação e compatibilidade do SDK são pré-requisitos externos.
+
+Sysfs inclui links cruzados entre class/drm, dev/char, bus/pci e devices, além de
+KFD topology e CPU/NUMA. Traces de vulkaninfo, EGL surfaceless e rocminfo consultaram
+essas árvores, sem acessos a `/run/udev/data`. A implementação inicial monta `/sys`
+completo read-only somente com GPU ativa; isso revela metadados de outros dispositivos
+e CPUs, mas não concede seus device nodes. Uma árvore seletiva exigiria reproduzir
+os links e topologia observados: complexidade adiada. Nenhum mount de udev ou `/run`
+foi adicionado. Os devices são individuais, sem card*, framebuffer ou display host.
+
+Diagnósticos diretos no host confirmaram Vulkan AMD, EGL surfaceless e ROCm.
+`eglinfo` geral retornou 2 por plataformas indisponíveis; o teste específico
+`eglinfo -B -p surfaceless` passou. Dentro do NativeLab, a suíte de hardware confirmou
+Vulkan Radeon, EGL AMD, rocminfo e kernel HIP: alocação, dispatch, sincronização,
+cópia e validação de 1024 valores em gfx1100. HIP foi compilado e executado dentro
+da sessão. GPU desligada: sem devices ou sysfs; graphics: sem KFD; namespaces,
+capabilities, rede privada e ausência de sockets X11/Wayland do host preservados.
+
+Xvfb 21.1.12: `glxinfo -B` reportou direct rendering Yes, mas Accelerated no e
+renderer llvmpipe. `glxgears` abriu/renderizou por software até o timeout esperado.
+`vkcube` selecionou Radeon RX 7900 XTX, mas saiu 1: `No DRI3 support detected`
+e `Could not find both graphics and present queues`. Portanto, acesso à GPU e
+apresentação numa janela X11 são requisitos diferentes. Xvfb fornece framebuffer
+em memória; não passa a oferecer DRI3 ao receber um render node. Nenhuma extensão
+ou variável foi forçada para mascarar esse resultado. Outro backend de display
+isolado ainda precisa ser escolhido e validado para janelas aceleradas.
+
+Lifecycle: sessões de digests diferentes são enumeradas por workspace exato.
+`stop --all` usa manifests salvos, PID/start-time e argv pareado, mesmo com TOML
+inválido. Um teste inicialmente comparava `status` recalculado de outro workspace:
+a remoção de placeholders de projetos trusted mudava seu digest, embora o holder
+original continuasse vivo. A asserção passou a validar a identidade salva original.
+Mocks cobrem ausência de hardware, paths arbitrários, symlinks, devices regulares,
+permissões, vendor/driver/sysfs, substituição do node, digest e holders não relacionados.
+CI não declara teste de hardware aprovado quando há apenas mocks: ausência retorna
+77 e é registrada como NOT RUN. O smoke de hardware exige seleção explícita.
+
+Referências: [DRM render nodes](https://docs.kernel.org/gpu/drm-uapi.html#render-nodes),
+[ROCm device passthrough](https://rocmdocs.amd.com/en/latest/install/docker-containers.html),
+[Xvfb](https://xorg.freedesktop.org/releases/X11R6.9.0/doc/html/Xvfb.1.html),
+[NVIDIA CDI](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/cdi-support.html).
+A extensão futura NVIDIA terá provider próprio; não há CUDA/backend fictício,
+leitura de CDI do workspace ou reprodução de opções Docker que relaxem o isolamento.
+
+Comparação solicitada fora do NativeLab: `xvfb-run -a -s '-screen 0 640x480x24 -nolisten tcp'` no host produziu exatamente o mesmo resultado. `xdpyinfo` anunciou GLX e Present, sem DRI3; `glxinfo` retornou llvmpipe/Accelerated no; `glxgears` executou até timeout de 5 segundos (124); `vkcube` selecionou a Radeon e saiu 1 por ausência de DRI3. O servidor temporário foi encerrado pelo xvfb-run. Isso localiza a limitação nesse caminho Xvfb, independentemente do sandbox.

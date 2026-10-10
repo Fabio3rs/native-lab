@@ -14,4 +14,5 @@ __pycache__/
 # Workspaces descartáveis criados pelos smoke tests.
 /.native-lab-smoke.*
 /.native-lab-policy-smoke.*
+/.native-lab-gpu-smoke.*
 /.native-lab-registry.*

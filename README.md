@@ -176,7 +176,7 @@ execute apenas código cujo risco você aceita. Falha ao criar qualquer
 propriedade essencial encerra o startup; não existe fallback para execução
 direta no host.
 
-## Filesystem policy v2
+## Filesystem policy v3
 
 A raiz não é mais `--ro-bind / /`. Ela começa vazia com `--tmpfs /`, e somente
 origens explicitamente permitidas são montadas:
@@ -326,9 +326,121 @@ Tanto esse arquivo quanto o config do Codex são parseados por `python3` com
 `tomllib`. O helper produz JSON canônico e argumentos NUL-delimited; ele nunca
 gera shell para `eval`.
 
+## GPU AMD por workspace
+
+GPU é opt-in no config confiável do host. `AGENTS.md`, trust do Codex e
+arquivos do projeto não concedem GPU. Configs v1 continuam funcionando sem
+GPU; para habilitar, altere `version` para `2` e acrescente uma entrada:
+
+```toml
+version = 2
+
+[gpu]
+default = "none"
+
+[gpu.workspaces."/mnt/projects/Projects/projeto-gpu"]
+provider = "amd"
+features = ["graphics", "compute"]
+devices = "auto"
+readonly_roots = ["/opt/amdgpu", "/opt/rocm-6.4.2"]
+```
+
+Os prefixos acima são exemplos de uma instalação real, não defaults. Use os
+caminhos presentes no seu host; o diagnóstico mostra bibliotecas e cobertura
+dos mounts. Não é necessário instalar ROCm para usar gráficos AMD.
+
+- `graphics`: render nodes selecionados para OpenGL/EGL/Vulkan.
+- `compute`: render nodes selecionados e `/dev/kfd` para ROCm/HIP.
+- Ambas podem coexistir. Lista vazia ou ausência de entrada significa GPU
+  desativada, inclusive seus mounts adicionais.
+- `devices = "auto"` exige uma única GPU física AMD; `"all"` autoriza todas.
+  Uma lista como `["0000:0b:00.0"]` seleciona endereços PCI completos. Todos
+  os render nodes associados à GPU selecionada, inclusive partições, entram
+  no manifest. `renderD128` não é identidade permanente.
+- `readonly_roots` tem default `[]` e só é aplicado com GPU ativa. Roots
+  adicionais são explícitos, RO e deduplicados; `/opt` inteiro é recusado.
+  Symlinks de prefixos preservam seu destino canônico. Dependências fora das
+  árvores autorizadas precisam de autorização própria; não são montadas
+  automaticamente. Runtime em `/usr` ou no workspace também pode ser usado.
+
+A chave de workspace é absoluta e canonicalizada como `realpath "$PWD"`;
+a autorização é exata, sem herança para subdiretórios. Aliases conflitantes,
+chaves desconhecidas, tipos errados e features inválidas causam erro.
+`nvidia` é reservado e retorna **provider ainda não implementado**; não há CUDA.
+
+O provider monta individualmente apenas os render nodes autorizados. Não
+monta `/dev/dri` inteiro, `card*`, framebuffer ou `/dev/mem`. Compute exige
+KFD existente e acessível. Os nodes são verificados por tipo, identidade,
+PCI/vendor/driver e abertura `O_RDWR`, novamente antes dos mounts e dentro do
+bootstrap. Nenhum workload é liberado se a identidade mudar.
+
+Com GPU ativa, **`/sys` completo é montado read-only**, incluindo metadados de
+outros dispositivos, topologia PCI, CPU/NUMA e KFD. Isso amplia a visibilidade
+do host. Não há mount adicional de `/run/udev/data`: os testes Mesa/ROCm
+funcionaram sem ele. `/usr`, `/lib` e `/etc` já disponibilizam bibliotecas,
+loaders e manifests ICD, portanto não são remontados para GPU.
+
+Nenhum driver Vulkan é forçado e variáveis como `VK_DRIVER_FILES`,
+`ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`, `ROCM_PATH` e `LD_LIBRARY_PATH`
+não são herdadas automaticamente. Se necessárias ao programa, passe-as
+explicitamente com `native-lab run env ...`; visibilidade por variável não
+substitui a restrição dos device nodes.
+
+```bash
+native-lab doctor gpu                  # host/config; não cria sessão
+native-lab run true                    # inicializa com a policy corrente
+native-lab doctor gpu --session        # também testa via SSH, sem criar sessão
+native-lab run vulkaninfo --summary
+native-lab run env EGL_PLATFORM=surfaceless eglinfo -B -p surfaceless
+native-lab run /opt/rocm-6.4.2/bin/rocminfo
+native-lab run /opt/rocm-6.4.2/bin/hipconfig --full
+```
+
+`doctor` diferencia autorização, abertura de devices, bibliotecas/manifests e
+runtime; o diagnóstico padrão não comprova aceleração. `--session` verifica
+uma sessão existente da policy corrente e identifica software rendering.
+`rocminfo` e `hipconfig` não comprovam execução de kernel HIP. O smoke físico
+compila e executa um kernel e valida os resultados dentro do NativeLab:
+
+```bash
+timeout 240 ./native-lab-gpu-smoke.sh --require-hardware \
+  --readonly-root /opt/amdgpu --readonly-root /opt/rocm-6.4.2
+```
+
+Permissões do host precisam permitir leitura/escrita nos nodes, por grupos
+`render`/`video` ou ACL apropriada. A eficácia deve ser testada após user
+namespace e SSH; grupos não mapeados podem aparecer como `65534` sem perder
+a autorização efetiva. No host testado, KFD funcionou sem ACL individual e
+sem alterar grupos. Se necessário em outra máquina, ACL/udev é uma decisão
+administrativa externa: NativeLab não aplica chmod, ACL, memberships ou
+capabilities extras.
+
+A GPU continua compartilhada com o host: não há exclusividade, quota de VRAM,
+isolamento de desempenho nem garantia contra travamentos/reset do driver.
+Acesso aos ioctls amplia a superfície do kernel. `graphics` também permite
+computação pelas APIs gráficas; os nomes de features descrevem recursos
+expostos, não uma proibição de tipos de algoritmos. X11/Wayland do host e
+Internet continuam ausentes; displays virtuais como Xvfb podem ser iniciados
+dentro da sessão e precisam de validação própria do renderer.
+
+
+No host AMD testado, Xvfb + GLX escolheu `llvmpipe` (`Accelerated: no`),
+e `glxgears` abriu uma janela renderizada por CPU. `vkcube` encontrou a Radeon,
+mas falhou com `No DRI3 support detected` e não apresentou a janela.
+`direct rendering: Yes` sozinho não comprova aceleração. Xvfb implementa um
+framebuffer em memória, sem a integração DRI3 necessária nesse caminho.
+Expor `/dev/dri/renderD*` não transforma Xvfb em um servidor acelerado.
+EGL surfaceless e Vulkan sem apresentação são testes separados; para janelas
+aceleradas será necessário validar outro servidor/compositor dentro da sessão.
+
+O contrato de recursos separa descoberta, autorização, mounts e diagnóstico.
+Um futuro provider NVIDIA poderá aproveitar conceitos de CDI/Container Toolkit,
+mas precisará resolver UVM, bibliotecas compatíveis, UUIDs e capabilities próprias.
+Nenhum descritor CDI ou hook do workspace será uma fonte confiável de autorização.
+
 ## Policy digest e identidade da sessão
 
-`POLICY_VERSION=2`. Antes de escolher uma sessão, o launcher resolve e ordena:
+`POLICY_VERSION=3`, `MANIFEST_VERSION=2`. Antes de escolher uma sessão, o launcher resolve e ordena:
 
 - roots RW e RO;
 - projetos trusted;
@@ -347,10 +459,13 @@ ID e não reutiliza uma sandbox criada com autorização anterior. O manifest
 resolvido e o resumo ficam no runtime; `status` mostra digest, número de roots
 RO e projetos trusted.
 
-Uma sessão antiga já em execução não perde retroativamente seus mounts quando
-o config muda. Pare a sessão antes de revogar acesso se houver processos
-long-lived; mudar o config garante não-reuso nas próximas chamadas, não revoga
-um processo que já existe.
+Uma sessão antiga não perde retroativamente seus mounts quando o config muda.
+`run` e `status` informam holders de outras policies do mesmo workspace.
+`stop` encerra a sessão da policy corrente; **`stop --all` encerra todas as
+sessões verificáveis do workspace canônico atual**, inclusive com config
+inválido ou GPU removida. A enumeração usa os manifests salvos e valida hash,
+PID, start-time e pares de argumentos; identidade inconclusiva impede sinais.
+Nenhuma sessão de outro workspace é selecionada por similaridade de nome.
 
 ## Ambiente e host-side TCB
 
@@ -406,6 +521,8 @@ native-lab
 native-labd
 native-lab-session
 native-lab-policy.py
+native_lab_gpu.py
+native-lab-gpu-probe.py
 ```
 
 `XDG_RUNTIME_DIR` deve ser absoluto, existir, pertencer ao usuário, ter modo
@@ -420,6 +537,9 @@ No diretório exato que deve ser RW:
 native-lab run COMMAND [ARGS...]
 native-lab status
 native-lab stop
+native-lab stop --all
+native-lab doctor gpu
+native-lab doctor gpu --session
 ```
 
 Exemplos:
@@ -674,7 +794,7 @@ AppArmor no runner descartável não é recomendação para uma máquina real.
 
 ## O que entra no Git
 
-Devem ser versionados os quatro executáveis/helper, smoke tests, documentação,
+Devem ser versionados os executáveis e helpers, smoke tests, documentação,
 `.gitignore` e `.github/workflows/ci.yml`. Não devem entrar sockets, logs,
 chaves SSH, `resolved-policy.json`, runtimes, fixtures temporárias ou
 `__pycache__`. O `.gitignore` cobre os artefatos locais conhecidos e o CI

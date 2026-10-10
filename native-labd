@@ -77,7 +77,7 @@ done
 [[ -d "$RUNTIME_ROOT" && ! -L "$RUNTIME_ROOT" ]] || die 'invalid runtime root'
 path_is_within "$SESSION_DIR" "$RUNTIME_ROOT" || die 'session directory is outside runtime root'
 [[ "$POLICY_DIGEST" =~ ^[0-9a-f]{64}$ ]] || die 'invalid policy digest'
-[[ "$POLICY_VERSION" == 2 ]] || die 'unsupported policy version'
+[[ "$POLICY_VERSION" == 3 ]] || die 'unsupported policy version'
 [[ -r "$POLICY_FILE" && -r "$POLICY_HELPER" ]] || die 'policy files are not readable'
 
 resolve_host_tool bwrap BWRAP_BIN
@@ -88,7 +88,7 @@ SCRIPT_DIR=$(dirname -- "$(realpath -- "$0")")
 SESSION_SCRIPT="$SCRIPT_DIR/native-lab-session"
 [[ -x "$SESSION_SCRIPT" ]] || die "missing executable: $SESSION_SCRIPT"
 
-"$PYTHON_BIN" "$POLICY_HELPER" verify \
+"$PYTHON_BIN" -I "$POLICY_HELPER" verify \
     --policy "$POLICY_FILE" \
     --workspace "$WORKSPACE" \
     --policy-version "$POLICY_VERSION" \
@@ -107,7 +107,7 @@ POLICY_MOUNT_LOCK="$RUNTIME_ROOT/policy-mount.lock"
 [[ -d "$CONTROL_DIR" && ! -L "$CONTROL_DIR" ]] ||
     die "invalid control directory: $CONTROL_DIR"
 
-"$PYTHON_BIN" "$POLICY_HELPER" summary --policy "$POLICY_FILE" >"$SUMMARY_FILE"
+"$PYTHON_BIN" -I "$POLICY_HELPER" summary --policy "$POLICY_FILE" >"$SUMMARY_FILE"
 HOME_VALUE=$(awk -F= '$1 == "home" { print substr($0, index($0, "=") + 1); exit }' "$SUMMARY_FILE")
 [[ -n "$HOME_VALUE" && "$HOME_VALUE" == /* ]] || die 'policy has invalid sandbox home'
 
@@ -130,7 +130,7 @@ rm -f -- "$SUMMARY_FILE"
 
 : >"$MASK_SOURCE"
 chmod 000 "$MASK_SOURCE"
-"$PYTHON_BIN" "$POLICY_HELPER" emit-bwrap \
+"$PYTHON_BIN" -I "$POLICY_HELPER" emit-bwrap \
     --policy "$POLICY_FILE" \
     --mask-source "$MASK_SOURCE" \
     --args-output "$BWRAP_ARGS_FILE" \
@@ -155,7 +155,7 @@ unregister_synthetics() {
         "$FLOCK_BIN" -x "$POLICY_LOCK_FD" || return 1
         POLICY_LOCK_HELD=1
     fi
-    if ! "$PYTHON_BIN" "$POLICY_HELPER" unregister-synthetics \
+    if ! "$PYTHON_BIN" -I "$POLICY_HELPER" unregister-synthetics \
         --policy "$POLICY_FILE" \
         --runtime-root "$RUNTIME_ROOT" \
         --session-id "$SESSION_ID"; then
@@ -191,7 +191,7 @@ trap shutdown EXIT INT TERM HUP
 # session lifetime; unregister_synthetics removes the empty placeholder only
 # after the last session using it exits.
 SYNTHETICS_REGISTERED=1
-"$PYTHON_BIN" "$POLICY_HELPER" register-synthetics \
+"$PYTHON_BIN" -I "$POLICY_HELPER" register-synthetics \
     --policy "$POLICY_FILE" \
     --runtime-root "$RUNTIME_ROOT" \
     --session-id "$SESSION_ID" \
@@ -200,6 +200,9 @@ SYNTHETICS_REGISTERED=1
 
 INTERNAL_SESSION_SCRIPT=/run/native-lab-bootstrap/native-lab-session
 USER_VALUE=$(id -un)
+# Recheck immediately before bubblewrap. The bootstrap checks the mounted
+# identities again before announcing readiness, closing the path-bind gap.
+"$PYTHON_BIN" -I "$POLICY_HELPER" validate-gpu --policy "$POLICY_FILE"
 (
     exec {POLICY_LOCK_FD}>&-
     exec "$BWRAP_BIN" \
@@ -215,6 +218,10 @@ USER_VALUE=$(id -un)
         --args "$BWRAP_ARGS_FD" \
         --dir /run/native-lab-bootstrap \
         --ro-bind "$SESSION_SCRIPT" "$INTERNAL_SESSION_SCRIPT" \
+        --ro-bind "$POLICY_HELPER" /run/native-lab-bootstrap/native-lab-policy.py \
+        --ro-bind "$SCRIPT_DIR/native_lab_gpu.py" /run/native-lab-bootstrap/native_lab_gpu.py \
+        --ro-bind "$SCRIPT_DIR/native-lab-gpu-probe.py" /run/native-lab-bootstrap/native-lab-gpu-probe.py \
+        --ro-bind "$POLICY_FILE" /run/native-lab-bootstrap/resolved-policy.json \
         --dir /run/native-lab-control \
         --bind "$CONTROL_DIR" /run/native-lab-control \
         --proc /proc \
@@ -243,6 +250,7 @@ while [[ ! -e "$MOUNTS_READY" ]] && (( SECONDS < deadline )); do
 done
 [[ -f "$MOUNTS_READY" && ! -L "$MOUNTS_READY" ]] ||
     die 'sandbox did not complete mount setup before timeout'
+"$PYTHON_BIN" -I "$POLICY_HELPER" validate-gpu --policy "$POLICY_FILE"
 : >"$MOUNTS_RELEASE"
 chmod 600 "$MOUNTS_RELEASE"
 "$FLOCK_BIN" -u "$POLICY_LOCK_FD"

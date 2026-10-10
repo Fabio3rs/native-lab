@@ -71,6 +71,7 @@ jobs:
           test -x native-lab-session
           test -x native-lab-smoke.sh
           test -x native-lab-policy-smoke.sh
+          test -x native-lab-gpu-smoke.sh
 
       - name: Check Bash syntax
         run: |
@@ -79,12 +80,15 @@ jobs:
             native-labd \
             native-lab-session \
             native-lab-smoke.sh \
-            native-lab-policy-smoke.sh
+            native-lab-policy-smoke.sh \
+            native-lab-gpu-smoke.sh
 
       - name: Check Python syntax
         run: |
           PYTHONPYCACHEPREFIX=/tmp/native-lab-pycache python3 -m py_compile \
             native-lab-policy.py \
+            native_lab_gpu.py \
+            native-lab-gpu-probe.py \
             native-lab-mcp \
             native_lab_mcp/*.py \
             tests/*.py
@@ -103,7 +107,24 @@ jobs:
             native-labd \
             native-lab-session \
             native-lab-smoke.sh \
-            native-lab-policy-smoke.sh
+            native-lab-policy-smoke.sh \
+            native-lab-gpu-smoke.sh
+
+      - name: GPU policy tests (no physical GPU required)
+        run: python3 -m unittest -v tests.test_gpu
+
+      - name: Verify unavailable GPU is explicitly skipped
+        run: |
+          if ! compgen -G '/dev/dri/renderD*' >/dev/null; then
+            set +e
+            ./native-lab-gpu-smoke.sh
+            result=$?
+            set -e
+            test "$result" -eq 77
+            echo 'GPU hardware tests NOT RUN: runner has no render nodes.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'GPU hardware tests NOT RUN: this job validates logic; use the explicit AMD hardware smoke separately.' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Reject committed runtime and private keys
         run: |

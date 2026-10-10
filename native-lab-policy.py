@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import pwd
+import re
 import stat
 import subprocess
 import sys
@@ -18,8 +20,13 @@ from pathlib import Path
 from typing import Any
 
 
-POLICY_VERSION = 2
-MANIFEST_VERSION = 1
+POLICY_VERSION = 3
+MANIFEST_VERSION = 2
+# Load only the adjacent trusted module, never a module from cwd/PYTHONPATH.
+_gpu_spec = importlib.util.spec_from_file_location("native_lab_gpu", Path(__file__).with_name("native_lab_gpu.py"))
+assert _gpu_spec is not None and _gpu_spec.loader is not None
+gpu = importlib.util.module_from_spec(_gpu_spec)
+_gpu_spec.loader.exec_module(gpu)
 MAX_DENY_MATCHES = 8192
 SYSTEM_READ_ONLY = (
     "/bin",
@@ -165,6 +172,7 @@ def parse_native_config(
     path: Path | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     defaults: dict[str, Any] = {
+        "gpu": {},
         "codex": {
             "import_trusted_projects": True,
             "config_path": "~/.codex/config.toml",
@@ -178,13 +186,13 @@ def parse_native_config(
         return defaults, {"version": 1}
 
     raw = load_toml(path, "NativeLab config")
-    allowed_root = {"version", "codex", "filesystem"}
+    allowed_root = {"version", "codex", "filesystem", "gpu"}
     unknown = sorted(set(raw) - allowed_root)
     if unknown:
         fail(f"unknown NativeLab config keys: {', '.join(unknown)}")
     version = raw.get("version", 1)
-    if not isinstance(version, int) or isinstance(version, bool) or version != 1:
-        fail("NativeLab config version must be integer 1")
+    if type(version) is not int or version not in {1, 2}:
+        fail("NativeLab config version must be integer 1 or 2")
 
     codex = expect_table(raw.get("codex", {}), "[codex]")
     unknown = sorted(set(codex) - {"import_trusted_projects", "config_path"})
@@ -198,6 +206,7 @@ def parse_native_config(
         fail(f"unknown [filesystem] keys: {', '.join(unknown)}")
 
     resolved = {
+        "gpu": gpu.parse_config(raw.get("gpu"), version),
         "codex": {
             "import_trusted_projects": expect_bool(
                 codex.get("import_trusted_projects", True),
@@ -317,7 +326,7 @@ def directory_is_empty(path: str) -> bool:
         return False
 
 
-def inspect_synthetic_registry(runtime_root: str, target: str) -> bool:
+def inspect_synthetic_registry(runtime_root: str, target: str, read_only: bool = False) -> bool:
     marker_dir = synthetic_marker_dir(runtime_root, target)
     try:
         entries = list(marker_dir.iterdir())
@@ -336,7 +345,7 @@ def inspect_synthetic_registry(runtime_root: str, target: str) -> bool:
             fail(f"invalid synthetic mount marker: {marker_path}")
         if marker_active:
             active_markers.append((marker_path, marker))
-        else:
+        elif not read_only:
             marker_path.unlink()
     if active_markers:
         if os.path.lexists(target):
@@ -356,7 +365,11 @@ def inspect_synthetic_registry(runtime_root: str, target: str) -> bool:
             fail(f"stale synthetic mount target changed type: {target}")
         if not directory_is_empty(target):
             fail(f"stale synthetic mount target gained content: {target}")
+        if read_only:
+            return True
         os.rmdir(target)
+    if read_only:
+        return False
     try:
         marker_dir.rmdir()
     except FileNotFoundError:
@@ -486,7 +499,7 @@ def collapse_masks(masks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
-def compile_policy(workspace: str, rg: str, runtime_root: str) -> dict[str, Any]:
+def compile_policy(workspace: str, rg: str, runtime_root: str, read_only: bool = False) -> dict[str, Any]:
     workspace = os.path.realpath(workspace)
     if not os.path.isdir(workspace):
         fail(f"workspace is not a directory: {workspace}")
@@ -517,7 +530,7 @@ def compile_policy(workspace: str, rg: str, runtime_root: str) -> dict[str, Any]
     trusted_projects = collect_trusted_projects(
         codex_config, home, home_canonical, workspace
     )
-    read_only, configured_read_only = collect_read_only_roots(
+    user_roots, configured_read_only = collect_read_only_roots(
         home,
         home_canonical,
         workspace,
@@ -536,7 +549,7 @@ def compile_policy(workspace: str, rg: str, runtime_root: str) -> dict[str, Any]
     masks: list[dict[str, Any]] = []
     for name in PROTECTED_METADATA:
         path = os.path.join(workspace, name)
-        if inspect_synthetic_registry(runtime_root, path):
+        if inspect_synthetic_registry(runtime_root, path, read_only):
             masks.append(
                 {
                     "path": path,
@@ -586,6 +599,8 @@ def compile_policy(workspace: str, rg: str, runtime_root: str) -> dict[str, Any]
         if os.path.lexists(path)
     ]
     manifest: dict[str, Any] = {
+        "gpu": gpu.resolve(native["gpu"].get(workspace), workspace, home,
+            [e["destination"] for e in system_read_only + user_roots] + trusted_projects),
         "manifest_version": MANIFEST_VERSION,
         "policy_version": POLICY_VERSION,
         "profile": "default",
@@ -606,7 +621,7 @@ def compile_policy(workspace: str, rg: str, runtime_root: str) -> dict[str, Any]
         "roots": {
             "read_write": [workspace],
             "system_read_only": system_read_only,
-            "user_read_only": read_only,
+            "user_read_only": user_roots,
             "configured_user_read_only": configured_read_only,
             "trusted_projects": trusted_projects,
         },
@@ -668,6 +683,15 @@ def load_manifest(path: Path) -> dict[str, Any]:
     ).hexdigest()
     if claimed != actual:
         fail("policy manifest digest mismatch")
+    version_pair = (manifest.get("policy_version"), manifest.get("manifest_version"))
+    if version_pair not in {(2, 1), (POLICY_VERSION, MANIFEST_VERSION)}:
+        fail("unsupported policy/manifest version")
+    for key in ("workspace", "profile"):
+        expect_string(manifest.get(key), f"manifest {key}")
+    if not os.path.isabs(manifest["workspace"]):
+        fail("manifest workspace must be absolute")
+    if version_pair == (POLICY_VERSION, MANIFEST_VERSION):
+        gpu.validate_schema(manifest.get("gpu"))
     return manifest
 
 
@@ -809,6 +833,17 @@ def append_arg(buffer: bytearray, *values: object) -> None:
 
 
 def emit_bwrap(manifest: dict[str, Any], mask_source: str) -> tuple[bytes, bytes]:
+    if manifest.get("policy_version") != POLICY_VERSION or manifest.get("manifest_version") != MANIFEST_VERSION:
+        fail("old manifests may only be inspected or stopped")
+    resources = manifest["gpu"]
+    gpu.revalidate(resources)
+    for mount in resources["readonly_mounts"]:
+        source = mount["source"]
+        if os.path.realpath(source) != source or not os.path.isdir(source):
+            fail(f"GPU mount source identity changed: {source}")
+    for link in resources["symlinks"]:
+        if os.path.realpath(link["path"]) != link["target"]:
+            fail(f"GPU runtime symlink changed: {link['path']}")
     args = bytearray()
     synthetic = bytearray()
     home = manifest["home"]["logical"]
@@ -829,6 +864,14 @@ def emit_bwrap(manifest: dict[str, Any], mask_source: str) -> tuple[bytes, bytes
         append_arg(args, "--ro-bind", entry["source"], entry["destination"])
     for project in roots["trusted_projects"]:
         append_arg(args, "--ro-bind", project, project)
+    for mount in resources["readonly_mounts"]:
+        append_arg(args, "--ro-bind", mount["source"], mount["destination"])
+    for link in resources["symlinks"]:
+        append_arg(args, "--symlink", link["target"], link["path"])
+    if resources["nodes"]:
+        append_arg(args, "--dir", "/dev/dri")
+    for node in resources["nodes"]:
+        append_arg(args, "--dev-bind", node["path"], node["path"])
     workspace = manifest["workspace"]
     append_arg(args, "--bind", workspace, workspace)
 
@@ -865,6 +908,157 @@ def summary_lines(manifest: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def private_session_file(path: Path, directory: bool = False) -> None:
+    metadata = path.lstat()
+    expected = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+        fail(f"unsafe session {'directory' if directory else 'file'}: {path}")
+
+
+def read_session_info(path: Path) -> dict[str, str]:
+    private_session_file(path)
+    values: dict[str, str] = {}
+    for line in path.read_text().splitlines():
+        key, separator, value = line.partition("=")
+        if not separator:
+            fail(f"invalid session metadata: {path}")
+        # Repeated root summary entries are informational, not identity fields.
+        if key in {"read_only_root", "read_write_root", "trusted_project"}:
+            continue
+        if key in values:
+            fail(f"duplicate session identity field: {path}: {key}")
+        values[key] = value
+    return values
+
+
+def session_record(directory: Path, workspace: str, daemon: str) -> dict[str, Any] | None:
+    private_session_file(directory.parent, True)
+    private_session_file(directory, True)
+    if not re.fullmatch(r"[0-9a-f]{24}", directory.name):
+        fail("invalid session directory name")
+    info = read_session_info(directory / "session.info")
+    if info.get("workspace") != workspace:
+        return None
+    private_session_file(directory / "resolved-policy.json")
+    manifest = load_manifest(directory / "resolved-policy.json")
+    version = str(manifest["policy_version"])
+    digest = manifest["policy_digest"]
+    profile = manifest["profile"]
+    if (manifest["workspace"] != workspace or profile != "default" or
+        info.get("policy_digest") != digest or info.get("policy_version") != version or
+        info.get("profile") != profile):
+        fail(f"inconsistent session metadata: {directory}")
+    calculated = hashlib.sha256("\0".join((workspace, profile, version, digest)).encode()).hexdigest()[:24]
+    if directory.name != calculated:
+        fail(f"session hash directory mismatch: {directory}")
+    holder = read_session_info(directory / "holder.pid")
+    if set(holder) != {"pid", "start_ticks", "session_id"} or holder["session_id"] != directory.name:
+        fail(f"invalid holder metadata: {directory}")
+    if not holder["pid"].isdigit() or int(holder["pid"]) <= 1 or not holder["start_ticks"].isdigit():
+        fail(f"invalid holder PID/start time: {directory}")
+    if info.get("holder_pid") != holder["pid"]:
+        fail(f"holder PID metadata mismatch: {directory}")
+    pid = int(holder["pid"])
+    record = dict(session_id=directory.name, policy_digest=digest, policy_version=version,
+                  pid=pid, start_ticks=holder["start_ticks"], state="stale")
+    if not process_identity_matches(pid, holder["start_ticks"]):
+        return record
+    expected = {
+        "--workspace": workspace, "--session-dir": str(directory),
+        "--session-id": directory.name, "--profile": profile,
+        "--policy-version": version, "--policy-digest": digest,
+        "--policy-file": str(directory / "resolved-policy.json"),
+        "--policy-helper": str(Path(daemon).with_name("native-lab-policy.py")),
+        "--runtime-root": str(directory.parent),
+    }
+    argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    if argv and argv[-1] == b"":
+        argv.pop()
+    argv_text = [os.fsdecode(a) for a in argv]
+    # Executed shell script: interpreter, script, then exact option/value pairs.
+    if len(argv_text) != 2 + 2 * len(expected) or argv_text[1] != daemon:
+        fail(f"holder argv identity mismatch: {directory}")
+    actual = dict(zip(argv_text[2::2], argv_text[3::2]))
+    if actual != expected or not process_identity_matches(pid, holder["start_ticks"]):
+        fail(f"holder argv/start-time identity mismatch: {directory}")
+    record["state"] = "active"
+    return record
+
+
+def list_sessions(runtime_root: str, workspace: str, daemon: str) -> list[dict[str, Any]]:
+    root = Path(runtime_root)
+    if not root.exists():
+        return []
+    private_session_file(root, True)
+    records = []
+    for directory in sorted(root.iterdir()):
+        if not re.fullmatch(r"[0-9a-f]{24}", directory.name):
+            continue
+        # Empty/stopped session directories intentionally retain their lock/log.
+        if not os.path.lexists(directory / "session.info"):
+            continue
+        try:
+            record = session_record(directory, workspace, daemon)
+            if record is not None:
+                records.append(record)
+        except (OSError, PolicyError, gpu.GPUError) as error:
+            warn(f"session not eligible for signaling: {directory.name}: {error}")
+            records.append(dict(session_id=directory.name, state="unverifiable", policy_digest="-", policy_version="-"))
+    return records
+
+
+def doctor_gpu(workspace: str) -> int:
+    """Read-only diagnostics: do not run compile_policy/registry recovery here."""
+    workspace = os.path.realpath(workspace)
+    home, home_canonical = real_home()
+    root = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    if not os.path.isabs(root) or overlaps(os.path.realpath(root), workspace):
+        fail("XDG_CONFIG_HOME must be absolute and outside the workspace")
+    config = checked_config_path(os.path.join(root, "native-lab/config.toml"), workspace, "NativeLab config")
+    native, _ = parse_native_config(config)
+    request = native["gpu"].get(workspace)
+    print(f"Workspace:       {workspace}")
+    if request is None or not request["features"]:
+        print("GPU:             disabled (no active workspace authorization)")
+        return 0
+    read_only, _ = collect_read_only_roots(home, home_canonical, workspace, native["filesystem"]["extra_read_only"])
+    covered = [p for p in SYSTEM_READ_ONLY if os.path.exists(p)] + [e["destination"] for e in read_only]
+    resources = gpu.resolve(request, workspace, home, covered)
+    print("\n".join(gpu.summary(resources)))
+    print("Host device open: OK (O_RDWR; namespace/SSH access not yet tested)")
+    print("Sandbox mounts/runtime: not tested; use doctor gpu --session on an existing session")
+    visible = covered + [m["destination"] for m in resources["readonly_mounts"]] + [workspace]
+    # ldconfig -p reads the host cache. Its binary comes from fixed system paths.
+    ldconfig = next((p for p in ("/usr/sbin/ldconfig", "/sbin/ldconfig") if os.path.isfile(p)), None)
+    if ldconfig and not is_within(os.path.realpath(ldconfig), workspace):
+        result = subprocess.run([ldconfig, "-p"], capture_output=True, text=True,
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}, timeout=10, check=False)
+        wanted = ("libvulkan.so", "libvulkan_radeon", "libEGL.so", "libEGL_mesa", "libGLX_mesa", "libhsa-runtime64", "libamdhip64")
+        for name in wanted:
+            entries = [line.strip() for line in result.stdout.splitlines() if line.strip().split(" ")[0].startswith(name)]
+            if not entries:
+                print(f"Library:         {name}: absent from host cache (workspace runtime may supply it)")
+            for line in entries:
+                path = line.rsplit(" => ", 1)[-1]
+                target = os.path.realpath(path)
+                accessible = os.path.isfile(target) and any(is_within(target, p) for p in visible)
+                print(f"Library:         {path}: {'covered' if accessible else 'not covered/missing; authorize its runtime root explicitly'}")
+    for directory in ("/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d", "/usr/share/glvnd/egl_vendor.d", "/etc/glvnd/egl_vendor.d", "/etc/OpenCL/vendors"):
+        files = sorted(Path(directory).glob("*"))
+        print(f"Driver manifests: {directory}: {', '.join(p.name for p in files) or 'absent/empty'}")
+        for path in files:
+            if path.suffix != ".json":
+                continue
+            try:
+                library = json.loads(path.read_text())["ICD"]["library_path"]
+                print(f"  {path.name}: implementation {library}")
+                if os.path.isabs(library) and not any(is_within(os.path.realpath(library), p) for p in visible):
+                    print("  implementation is outside mounted roots")
+            except (OSError, ValueError, KeyError, TypeError):
+                print(f"  invalid/unreadable driver manifest: {path}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -890,9 +1084,35 @@ def main() -> int:
     summary = subparsers.add_parser("summary")
     summary.add_argument("--policy", required=True)
 
+    gpu_summary = subparsers.add_parser("gpu-summary")
+    gpu_summary.add_argument("--policy", required=True)
+    validate_gpu = subparsers.add_parser("validate-gpu")
+    validate_gpu.add_argument("--policy", required=True)
+
+    doctor = subparsers.add_parser("doctor-gpu")
+    doctor.add_argument("--workspace", required=True)
+    fingerprint = subparsers.add_parser("fingerprint")
+    fingerprint.add_argument("--workspace", required=True)
+    fingerprint.add_argument("--rg", required=True)
+    fingerprint.add_argument("--runtime-root", required=True)
+    sessions = subparsers.add_parser("sessions")
+    sessions.add_argument("--runtime-root", required=True)
+    sessions.add_argument("--workspace", required=True)
+    sessions.add_argument("--daemon", required=True)
+    sessions.add_argument("--nul", action="store_true")
+    sessions.add_argument("--current-digest", default="")
+    holder_check = subparsers.add_parser("holder-check")
+    holder_check.add_argument("--session-dir", required=True)
+    holder_check.add_argument("--workspace", required=True)
+    holder_check.add_argument("--daemon", required=True)
+    holder_check.add_argument("--pid", required=True, type=int)
+    holder_check.add_argument("--start-ticks", required=True)
+    holder_check.add_argument("--session-id", required=True)
+    holder_check.add_argument("--policy-digest", required=True)
+
     value = subparsers.add_parser("value")
     value.add_argument("--policy", required=True)
-    value.add_argument("--key", required=True, choices=("home",))
+    value.add_argument("--key", required=True, choices=("home", "gpu-enabled"))
 
     register = subparsers.add_parser("register-synthetics")
     register.add_argument("--policy", required=True)
@@ -907,6 +1127,26 @@ def main() -> int:
     unregister.add_argument("--session-id", required=True)
 
     args = parser.parse_args()
+    if args.command == "doctor-gpu":
+        return doctor_gpu(args.workspace)
+    if args.command == "fingerprint":
+        manifest = compile_policy(args.workspace, args.rg, args.runtime_root, read_only=True)
+        print(manifest["policy_digest"])
+        print(manifest["home"]["logical"])
+        return 0
+    if args.command == "sessions":
+        records = list_sessions(args.runtime_root, os.path.realpath(args.workspace), args.daemon)
+        for record in records:
+            if args.nul:
+                if record["state"] != "unverifiable":
+                    sys.stdout.buffer.write((record["session_id"] + "\0" + record["policy_digest"] + "\0" + record["policy_version"] + "\0").encode())
+            elif record["policy_digest"] != args.current_digest:
+                print(f"Other session:   {record['session_id']} {record['state']} policy={record['policy_version']} digest={record['policy_digest']}")
+        return int(any(r["state"] == "unverifiable" for r in records))
+    if args.command == "holder-check":
+        record = session_record(Path(args.session_dir), args.workspace, args.daemon)
+        return int(not record or record["state"] != "active" or any(record[key] != value for key, value in {
+            "pid": args.pid, "start_ticks": args.start_ticks, "session_id": args.session_id, "policy_digest": args.policy_digest}.items()))
     if args.command == "resolve":
         lock_path = Path(args.runtime_root, "policy-mount.lock")
         with lock_path.open("a+b") as lock:
@@ -919,12 +1159,20 @@ def main() -> int:
 
     manifest = load_manifest(Path(args.policy))
     if args.command == "verify":
+        if manifest.get("policy_version") != POLICY_VERSION:
+            fail("old manifests may only be inspected or stopped")
         if manifest.get("workspace") != os.path.realpath(args.workspace):
             fail("policy manifest workspace mismatch")
         if manifest.get("policy_version") != args.policy_version:
             fail("policy manifest version mismatch")
         if manifest.get("policy_digest") != args.policy_digest:
             fail("policy manifest digest does not match daemon argument")
+        return 0
+    if args.command == "gpu-summary":
+        print("\n".join(gpu.summary(manifest.get("gpu", gpu.disabled()))))
+        return 0
+    if args.command == "validate-gpu":
+        gpu.revalidate(manifest.get("gpu", gpu.disabled()))
         return 0
     if args.command == "emit-bwrap":
         bwrap_args, synthetic = emit_bwrap(manifest, args.mask_source)
@@ -937,6 +1185,9 @@ def main() -> int:
     if args.command == "value":
         if args.key == "home":
             print(manifest["home"]["logical"])
+            return 0
+        if args.key == "gpu-enabled":
+            print(int(manifest.get("gpu", gpu.disabled())["provider"] != "none"))
             return 0
     if args.command == "register-synthetics":
         register_synthetics(
@@ -953,6 +1204,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except PolicyError as error:
+    except (PolicyError, gpu.GPUError, OSError) as error:
         print(f"native-lab-policy: {error}", file=sys.stderr)
         raise SystemExit(1)

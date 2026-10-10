@@ -9,7 +9,7 @@ PATH=$HOST_PATH
 export PATH
 
 readonly PROFILE="default"
-readonly POLICY_VERSION="2"
+readonly POLICY_VERSION="3"
 readonly STARTUP_TIMEOUT_SECONDS="5"
 readonly STOP_GRACE_SECONDS="2"
 
@@ -33,6 +33,8 @@ Usage:
   native-lab run [--] COMMAND [ARGS...]
   native-lab status
   native-lab stop
+  native-lab stop --all
+  native-lab doctor gpu [--session]
 EOF
     exit 2
 }
@@ -113,17 +115,18 @@ compute_session_id() {
 
 resolve_policy() {
     POLICY_TMP="$RUNTIME_ROOT/.resolved-policy.$$.$RANDOM.json"
-    POLICY_DIGEST=$("$PYTHON_BIN" "$POLICY_HELPER" resolve \
+    POLICY_DIGEST=$("$PYTHON_BIN" -I "$POLICY_HELPER" resolve \
         --workspace "$WORKSPACE" \
         --rg "$RG_BIN" \
         --runtime-root "$RUNTIME_ROOT" \
-        --output "$POLICY_TMP") || die 'failed to resolve filesystem policy'
+        --output "$POLICY_TMP") || { printf 'native-lab: failed to resolve policy\n' >&2; return 1; }
     [[ "$POLICY_DIGEST" =~ ^[0-9a-f]{64}$ && -s "$POLICY_TMP" ]] ||
         die 'policy compiler returned invalid output'
-    SANDBOX_HOME=$("$PYTHON_BIN" "$POLICY_HELPER" value --policy "$POLICY_TMP" --key home) ||
+    SANDBOX_HOME=$("$PYTHON_BIN" -I "$POLICY_HELPER" value --policy "$POLICY_TMP" --key home) ||
         die 'cannot read sandbox home from resolved policy'
     [[ "$SANDBOX_HOME" == /* ]] || die 'resolved policy returned an invalid sandbox home'
     SANDBOX_RUNTIME="/run/user/$(id -u)"
+    GPU_ENABLED=$("$PYTHON_BIN" -I "$POLICY_HELPER" value --policy "$POLICY_TMP" --key gpu-enabled)
 }
 
 setup_session_paths() {
@@ -156,7 +159,7 @@ session_metadata_matches() {
     saved_policy=$(read_info_value "$INFO_FILE" policy_version 2>/dev/null) || return 1
     saved_digest=$(read_info_value "$INFO_FILE" policy_digest 2>/dev/null) || return 1
     [[ "$saved_workspace" == "$WORKSPACE" && "$saved_profile" == "$PROFILE" &&
-       "$saved_policy" == "$POLICY_VERSION" && "$saved_digest" == "$POLICY_DIGEST" ]]
+       "$saved_policy" == "${SESSION_POLICY_VERSION:-$POLICY_VERSION}" && "$saved_digest" == "$POLICY_DIGEST" ]]
 }
 
 reject_metadata_collision() {
@@ -219,6 +222,16 @@ session_alive() {
     "$SSH_BIN" "${SSH_ARGS[@]}" "$login_user@native-lab" true </dev/null >/dev/null 2>&1
 }
 
+validate_session_gpu_access() {
+    [[ "$GPU_ENABLED" == 1 ]] || return 0
+    local login_user
+    IFS= read -r login_user <"$CONTROL_DIR/user"
+    build_ssh_args
+    encode_remote_command /usr/bin/python3 -I /run/native-lab-bootstrap/native-lab-policy.py \
+        validate-gpu --policy /run/native-lab-bootstrap/resolved-policy.json
+    "$SSH_BIN" "${SSH_ARGS[@]}" "$login_user@native-lab" "$REMOTE_COMMAND" </dev/null
+}
+
 cmdline_has_exact_arg() {
     local pid=$1 wanted=$2 arg
     [[ -r "/proc/$pid/cmdline" ]] || return 1
@@ -237,15 +250,46 @@ read_holder_identity() {
 }
 
 holder_matches() {
-    local actual_start
     read_holder_identity || return 1
-    [[ -r "/proc/$HOLDER_PID/stat" ]] || return 1
-    actual_start=$(awk '{print $22}' "/proc/$HOLDER_PID/stat" 2>/dev/null) || return 1
-    [[ "$actual_start" == "$HOLDER_START" ]] || return 1
-    cmdline_has_exact_arg "$HOLDER_PID" "$DAEMON" || return 1
-    cmdline_has_exact_arg "$HOLDER_PID" "$SESSION_DIR" || return 1
-    cmdline_has_exact_arg "$HOLDER_PID" "$WORKSPACE" || return 1
-    cmdline_has_exact_arg "$HOLDER_PID" "$POLICY_DIGEST" || return 1
+    "$PYTHON_BIN" -I "$POLICY_HELPER" holder-check \
+        --session-dir "$SESSION_DIR" --workspace "$WORKSPACE" --daemon "$DAEMON" \
+        --pid "$HOLDER_PID" --start-ticks "$HOLDER_START" \
+        --session-id "$SESSION_ID" --policy-digest "$POLICY_DIGEST" 2>/dev/null
+}
+
+workspace_lock() {
+    local workspace_hash
+    workspace_hash=$(printf '%s' "$WORKSPACE" | sha256sum)
+    workspace_hash=${workspace_hash%% *}
+    exec {WORKSPACE_LOCK_FD}>"$RUNTIME_ROOT/workspace-$workspace_hash.lock"
+    flock -x "$WORKSPACE_LOCK_FD"
+}
+
+release_workspace_lock() {
+    flock -u "$WORKSPACE_LOCK_FD"
+    exec {WORKSPACE_LOCK_FD}>&-
+}
+
+show_other_sessions() {
+    "$PYTHON_BIN" -I "$POLICY_HELPER" sessions --runtime-root "$RUNTIME_ROOT" \
+        --workspace "$WORKSPACE" --daemon "$DAEMON" --current-digest "${POLICY_DIGEST:-}" || true
+}
+
+stop_all_command() {
+    local list_file result=0
+    list_file="$RUNTIME_ROOT/.session-list.$$.$RANDOM"
+    if ! "$PYTHON_BIN" -I "$POLICY_HELPER" sessions --runtime-root "$RUNTIME_ROOT" \
+        --workspace "$WORKSPACE" --daemon "$DAEMON" --nul >"$list_file"; then
+        result=1
+    fi
+    while IFS= read -r -d '' SESSION_ID && IFS= read -r -d '' POLICY_DIGEST &&
+          IFS= read -r -d '' SESSION_POLICY_VERSION; do
+        setup_session_paths
+        # Each stop retains collision, holder and synthetic ownership checks.
+        (stop_command) || result=1
+    done <"$list_file"
+    rm -f -- "$list_file"
+    return "$result"
 }
 
 terminate_holder() {
@@ -275,7 +319,7 @@ cleanup_session_synthetics() {
     exec {POLICY_CLEANUP_FD}>"$RUNTIME_ROOT/policy-mount.lock"
     flock -x "$POLICY_CLEANUP_FD"
     set +e
-    "$PYTHON_BIN" "$POLICY_HELPER" unregister-synthetics \
+    "$PYTHON_BIN" -I "$POLICY_HELPER" unregister-synthetics \
         --policy "$POLICY_FILE" \
         --runtime-root "$RUNTIME_ROOT" \
         --session-id "$SESSION_ID"
@@ -308,6 +352,7 @@ start_session() {
         # A client killed during startup must not leave the lock held by the
         # long-lived daemon through an inherited descriptor.
         exec {LOCK_FD}>&-
+        exec {WORKSPACE_LOCK_FD}>&-
         exec "$NOHUP_BIN" "$DAEMON" \
             --workspace "$WORKSPACE" \
             --session-dir "$SESSION_DIR" \
@@ -333,10 +378,16 @@ wait_session_ready() {
 
 ensure_session() {
     reject_metadata_collision
-    session_alive && return 0
+    if session_alive; then
+        holder_matches || die 'session is operational but holder identity is invalid'
+        validate_session_gpu_access || die 'GPU devices cannot be opened after SSH; refusing workload'
+        return 0
+    fi
     acquire_lock
     reject_metadata_collision
     if session_alive; then
+        holder_matches || die 'session is operational but holder identity is invalid'
+        validate_session_gpu_access || die 'GPU devices cannot be opened after SSH; refusing workload'
         release_lock
         return 0
     fi
@@ -358,6 +409,11 @@ ensure_session() {
         fi
         exit 1
     fi
+    if ! validate_session_gpu_access; then
+        terminate_holder || true
+        release_lock
+        die 'GPU devices cannot be opened after SSH; startup aborted'
+    fi
     release_lock
 }
 
@@ -377,6 +433,8 @@ run_command() {
     fi
     ensure_session_dirs
     ensure_session
+    show_other_sessions >&2
+    release_workspace_lock
     encode_remote_command "$@"
 
     local login_user
@@ -396,7 +454,7 @@ status_command() {
         created=$(read_info_value "$INFO_FILE" created 2>/dev/null || printf '%s' '-')
         ro_count=$(read_info_value "$INFO_FILE" read_only_root_count 2>/dev/null || printf '%s' '-')
         trusted_count=$(read_info_value "$INFO_FILE" trusted_project_count 2>/dev/null || printf '%s' '-')
-        if session_alive; then
+        if session_alive && holder_matches; then
             state=alive
         elif [[ -e "$PID_FILE" || -e "$SOCK" || -e "$INFO_FILE" ]]; then
             state=stale
@@ -408,6 +466,7 @@ status_command() {
     printf 'Profile:         %s\n' "$PROFILE"
     printf 'Policy:          %s\n' "$POLICY_VERSION"
     printf 'Policy digest:   %s\n' "$POLICY_DIGEST"
+    "$PYTHON_BIN" -I "$POLICY_HELPER" gpu-summary --policy "$POLICY_TMP"
     printf 'RO roots:        %s\n' "$ro_count"
     printf 'Trusted projects: %s\n' "$trusted_count"
     if [[ -s "$INFO_FILE" ]]; then
@@ -417,6 +476,7 @@ status_command() {
     printf 'SSH socket:      %s\n' "$state"
     printf 'Holder PID:      %s\n' "$holder"
     printf 'Created:         %s\n' "$created"
+    show_other_sessions
     [[ "$state" == alive ]]
 }
 
@@ -438,6 +498,9 @@ stop_command() {
             release_lock
             die 'holder could not be terminated safely'
         }
+    elif read_holder_identity && [[ -e "/proc/$HOLDER_PID" ]]; then
+        release_lock
+        die 'holder identity cannot be validated; refusing to signal or remove session state'
     fi
     if ! cleanup_session_synthetics; then
         release_lock
@@ -455,17 +518,54 @@ main() {
     need stat
     need flock
     need awk
-    validate_runtime_dir
     resolve_workspace
     SCRIPT_DIR=$(dirname -- "$(realpath -- "$0")")
     DAEMON="$SCRIPT_DIR/native-labd"
     POLICY_HELPER="$SCRIPT_DIR/native-lab-policy.py"
     [[ -x "$DAEMON" ]] || die "missing executable: $DAEMON"
     [[ -r "$POLICY_HELPER" ]] || die "missing policy helper: $POLICY_HELPER"
+    # Doctor does not create runtime directories or recover synthetic mounts.
+    if [[ "$1" == doctor ]]; then
+        [[ "${2:-}" == gpu && ($# == 2 || ($# == 3 && "$3" == --session)) ]] || usage
+        resolve_host_tool python3 PYTHON_BIN
+        "$PYTHON_BIN" -I "$POLICY_HELPER" doctor-gpu --workspace "$WORKSPACE" || return 1
+        if (($# == 2)); then return 0; fi
+        validate_runtime_dir
+        resolve_host_tcb
+        RUNTIME_ROOT="$XDG_RUNTIME_DIR/native-lab"
+        local values login_user
+        values=$("$PYTHON_BIN" -I "$POLICY_HELPER" fingerprint --workspace "$WORKSPACE" \
+            --rg "$RG_BIN" --runtime-root "$RUNTIME_ROOT") || return 1
+        POLICY_DIGEST=${values%%$'\n'*}
+        SANDBOX_HOME=${values#*$'\n'}
+        SANDBOX_RUNTIME="/run/user/$(id -u)"
+        compute_session_id
+        setup_session_paths
+        [[ -d "$SESSION_DIR" ]] || die 'no existing session for the current policy; doctor will not start one'
+        private_dir_ok "$SESSION_DIR" || die 'unsafe session directory'
+        reject_metadata_collision
+        holder_matches || die 'existing session holder identity is invalid'
+        session_alive || die 'existing session SSH is not available'
+        encode_remote_command /usr/bin/python3 -I /run/native-lab-bootstrap/native-lab-gpu-probe.py
+        IFS= read -r login_user <"$CONTROL_DIR/user"
+        build_ssh_args
+        "$SSH_BIN" "${SSH_ARGS[@]}" "$login_user@native-lab" "$REMOTE_COMMAND"
+        return
+    fi
+    validate_runtime_dir
     resolve_host_tcb
     RUNTIME_ROOT="$XDG_RUNTIME_DIR/native-lab"
     ensure_private_dir "$RUNTIME_ROOT"
-    resolve_policy
+    workspace_lock
+    if [[ "$1" == stop && "${2:-}" == --all && $# == 2 ]]; then
+        stop_all_command
+        return
+    fi
+    if ! resolve_policy; then
+        show_other_sessions
+        printf 'native-lab: use stop --all to revoke existing workspace sessions\n' >&2
+        return 1
+    fi
     compute_session_id
     setup_session_paths
 
