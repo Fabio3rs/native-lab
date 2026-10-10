@@ -363,6 +363,20 @@ class SessionIdentityTests(unittest.TestCase):
         with self.assertRaises(policy.PolicyError):
             self.read_record(["sleep", *self.argv])
 
+    def test_another_installation_cannot_validate_holder(self):
+        args = self.argv.copy()
+        args[1] = "/other/native-labd"
+        with self.assertRaisesRegex(policy.PolicyError, "check CLI/MCP installation paths"):
+            self.read_record(args)
+
+    def test_process_diagnostics_distinguish_failure_causes(self):
+        for error, expected in [(FileNotFoundError(), "PID not visible"),
+                                (PermissionError(), "permission denied")]:
+            with patch.object(Path, "read_text", side_effect=error):
+                self.assertIn(expected, policy.process_identity_diagnostic(self.pid, self.start))
+        with patch.object(Path, "read_text", return_value="123 (name with spaces) " + " ".join(["S"] + ["0"] * 18 + ["999"])):
+            self.assertIn("start_ticks mismatch", policy.process_identity_diagnostic(self.pid, self.start))
+
     def test_reused_pid_not_active(self):
         with patch.object(policy, "process_identity_matches", return_value=False):
             self.assertEqual(policy.session_record(self.directory, self.workspace, self.daemon)["state"], "stale")

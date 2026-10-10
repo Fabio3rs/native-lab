@@ -660,6 +660,7 @@ shell no host:
 | `write` | escreve UTF-8 no stdin e pode enviar EOF |
 | `kill` | sinaliza o grupo do cliente SSH (`TERM`, ou `KILL` com `force`) |
 | `processes` | lista os handles pertencentes à instância do servidor MCP |
+| `diagnostics` | contexto e caminhos do servidor MCP, sem iniciar sessões |
 
 Crie o ambiente e instale o lock preparado no repositório:
 
@@ -686,6 +687,27 @@ pode apontar para outro launcher confiável. Cada processo é executado como:
 ```text
 native-lab run -- argv[0] argv[1] ...
 ```
+
+Se a CLI foi instalada em `~/.local/bin`, alinhe o MCP com essa instalação:
+
+```toml
+[mcp_servers.native_lab.env]
+NATIVE_LAB_BIN = "/home/usuario/.local/bin/native-lab"
+```
+
+Use seu caminho absoluto real e reinicie o servidor MCP após a alteração.
+Sem esse override, o MCP usa o launcher ao lado do pacote no checkout. CLI e
+MCP podem encontrar o mesmo session ID, mas caminhos de daemon diferentes são
+recusados pela verificação de identidade. Não é necessário desligar uma sessão
+válida para corrigir a configuração do cliente.
+
+`diagnostics` é somente leitura e informa o contexto do próprio servidor MCP:
+PID, UID/grupos, namespaces PID/mount/user, cwd, XDG_RUNTIME_DIR e launcher/daemon
+selecionados. Não confunda esse contexto com o shell do agente. Erros de holder
+agora incluem a causa; o helper `holder-check --diagnose` aceita os mesmos
+argumentos de identidade e retorna JSON sem relaxar a validação. PID ausente em
+`/proc` pode significar processo encerrado ou invisível em outro namespace.
+
 
 O `expect` faz matching literal, inclusive através de boundaries das leituras.
 `from_position="now"` é o default e observa somente eventos novos;

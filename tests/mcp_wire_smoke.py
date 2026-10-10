@@ -11,7 +11,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 
 ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_TOOLS = {"run", "head", "tail", "expect", "wait", "write", "kill", "processes"}
+EXPECTED_TOOLS = {"run", "head", "tail", "expect", "wait", "write", "kill", "processes", "diagnostics"}
 
 
 async def smoke() -> None:
@@ -27,6 +27,14 @@ async def smoke() -> None:
             listed = await session.list_tools()
             names = {tool.name for tool in listed.tools}
             assert names == EXPECTED_TOOLS, (names, EXPECTED_TOOLS)
+            result = await session.call_tool("diagnostics", {})
+            assert not result.is_error
+            import json
+            data = json.loads(result.content[0].text)
+            assert data["cwd"] == str(ROOT)
+            assert data["pid"] > 0
+            assert set(data["namespaces"]) == {"pid", "mnt", "user"}
+            assert data["native_lab_binary"].endswith("/native-lab")
 
 
 if __name__ == "__main__":

@@ -298,6 +298,24 @@ def process_identity_matches(pid: int, start_ticks: str) -> bool:
     return len(fields) > 19 and fields[19] == start_ticks
 
 
+def process_identity_diagnostic(pid: int, start_ticks: str) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return "PID not visible in this /proc (exited process or different PID namespace)"
+    except PermissionError:
+        return "permission denied reading holder /proc/stat"
+    except OSError as error:
+        return f"cannot read holder /proc/stat: {error}"
+    closing = raw.rfind(") ")
+    fields = raw[closing + 2:].split() if closing >= 0 else []
+    if len(fields) <= 19:
+        return "invalid holder /proc/stat"
+    if fields[19] != start_ticks:
+        return f"holder start_ticks mismatch: expected {start_ticks}, observed {fields[19]}"
+    return "holder process identity changed during validation"
+
+
 def read_marker(path: Path, expected_target: str) -> tuple[bool, dict[str, Any] | None]:
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -962,6 +980,7 @@ def session_record(directory: Path, workspace: str, daemon: str) -> dict[str, An
     record = dict(session_id=directory.name, policy_digest=digest, policy_version=version,
                   pid=pid, start_ticks=holder["start_ticks"], state="stale")
     if not process_identity_matches(pid, holder["start_ticks"]):
+        record["reason"] = process_identity_diagnostic(pid, holder["start_ticks"])
         return record
     expected = {
         "--workspace": workspace, "--session-dir": str(directory),
@@ -977,7 +996,7 @@ def session_record(directory: Path, workspace: str, daemon: str) -> dict[str, An
     argv_text = [os.fsdecode(a) for a in argv]
     # Executed shell script: interpreter, script, then exact option/value pairs.
     if len(argv_text) != 2 + 2 * len(expected) or argv_text[1] != daemon:
-        fail(f"holder argv identity mismatch: {directory}")
+        fail(f"holder argv identity mismatch: expected daemon {daemon!r}, observed {argv_text[1:2]!r}; check CLI/MCP installation paths")
     actual = dict(zip(argv_text[2::2], argv_text[3::2]))
     if actual != expected or not process_identity_matches(pid, holder["start_ticks"]):
         fail(f"holder argv/start-time identity mismatch: {directory}")
@@ -1102,6 +1121,7 @@ def main() -> int:
     sessions.add_argument("--nul", action="store_true")
     sessions.add_argument("--current-digest", default="")
     holder_check = subparsers.add_parser("holder-check")
+    holder_check.add_argument("--diagnose", action="store_true")
     holder_check.add_argument("--session-dir", required=True)
     holder_check.add_argument("--workspace", required=True)
     holder_check.add_argument("--daemon", required=True)
@@ -1144,9 +1164,35 @@ def main() -> int:
                 print(f"Other session:   {record['session_id']} {record['state']} policy={record['policy_version']} digest={record['policy_digest']}")
         return int(any(r["state"] == "unverifiable" for r in records))
     if args.command == "holder-check":
-        record = session_record(Path(args.session_dir), args.workspace, args.daemon)
-        return int(not record or record["state"] != "active" or any(record[key] != value for key, value in {
-            "pid": args.pid, "start_ticks": args.start_ticks, "session_id": args.session_id, "policy_digest": args.policy_digest}.items()))
+        reason = "verified"
+        try:
+            record = session_record(Path(args.session_dir), args.workspace, args.daemon)
+            if not record:
+                reason = "workspace does not match saved session"
+            elif record["state"] != "active":
+                reason = record.get("reason", "holder is not active")
+            else:
+                for key, value in {"pid": args.pid, "start_ticks": args.start_ticks,
+                                   "session_id": args.session_id, "policy_digest": args.policy_digest}.items():
+                    if record[key] != value:
+                        reason = f"requested {key} does not match saved session"
+                        break
+        except (PolicyError, gpu.GPUError, OSError) as error:
+            reason = str(error)
+        valid = reason == "verified"
+        if args.diagnose:
+            namespaces = {}
+            for name in ("pid", "mnt", "user"):
+                try:
+                    namespaces[name] = os.readlink(f"/proc/self/ns/{name}")
+                except OSError as error:
+                    namespaces[name] = str(error)
+            print(json.dumps(dict(valid=valid, reason=reason, observer_pid=os.getpid(),
+                                  observer_uid=os.getuid(), namespaces=namespaces,
+                                  expected_daemon=args.daemon)))
+        elif not valid:
+            print(f"native-lab-policy: {reason}", file=sys.stderr)
+        return int(not valid)
     if args.command == "resolve":
         lock_path = Path(args.runtime_root, "policy-mount.lock")
         with lock_path.open("a+b") as lock:

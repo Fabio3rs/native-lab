@@ -250,11 +250,12 @@ read_holder_identity() {
 }
 
 holder_matches() {
+    HOLDER_DIAGNOSTIC='invalid or missing holder.pid metadata'
     read_holder_identity || return 1
-    "$PYTHON_BIN" -I "$POLICY_HELPER" holder-check \
+    HOLDER_DIAGNOSTIC=$("$PYTHON_BIN" -I "$POLICY_HELPER" holder-check \
         --session-dir "$SESSION_DIR" --workspace "$WORKSPACE" --daemon "$DAEMON" \
         --pid "$HOLDER_PID" --start-ticks "$HOLDER_START" \
-        --session-id "$SESSION_ID" --policy-digest "$POLICY_DIGEST" 2>/dev/null
+        --session-id "$SESSION_ID" --policy-digest "$POLICY_DIGEST" 2>&1)
 }
 
 workspace_lock() {
@@ -379,14 +380,14 @@ wait_session_ready() {
 ensure_session() {
     reject_metadata_collision
     if session_alive; then
-        holder_matches || die 'session is operational but holder identity is invalid'
+        holder_matches || die "session is operational but holder identity is invalid: $HOLDER_DIAGNOSTIC"
         validate_session_gpu_access || die 'GPU devices cannot be opened after SSH; refusing workload'
         return 0
     fi
     acquire_lock
     reject_metadata_collision
     if session_alive; then
-        holder_matches || die 'session is operational but holder identity is invalid'
+        holder_matches || die "session is operational but holder identity is invalid: $HOLDER_DIAGNOSTIC"
         validate_session_gpu_access || die 'GPU devices cannot be opened after SSH; refusing workload'
         release_lock
         return 0
@@ -481,6 +482,7 @@ status_command() {
 }
 
 stop_command() {
+    local outcome="recovered residual state for"
     if [[ ! -d "$SESSION_DIR" ]]; then
         printf 'native-lab: session already stopped (%s)\n' "$SESSION_ID"
         return 0
@@ -489,11 +491,18 @@ stop_command() {
     acquire_lock
     reject_metadata_collision
 
+    if [[ ! -e "$PID_FILE" && ! -e "$INFO_FILE" && ! -e "$POLICY_FILE" &&
+          ! -e "$MASK_FILE" && ! -e "$CONTROL_DIR" && ! -L "$CONTROL_DIR" ]]; then
+        release_lock
+        printf 'native-lab: session already stopped (%s)\n' "$SESSION_ID"
+        return 0
+    fi
     if session_alive && ! holder_matches; then
         release_lock
-        die 'session is operational but holder identity is invalid; refusing to signal a process'
+        die "session is operational but holder identity is invalid; refusing to signal a process: $HOLDER_DIAGNOSTIC"
     fi
     if holder_matches; then
+        outcome="stopped"
         terminate_holder || {
             release_lock
             die 'holder could not be terminated safely'
@@ -508,7 +517,7 @@ stop_command() {
     fi
     cleanup_stale_state
     release_lock
-    printf 'native-lab: stopped session %s\n' "$SESSION_ID"
+    printf 'native-lab: %s session %s\n' "$outcome" "$SESSION_ID"
 }
 
 main() {

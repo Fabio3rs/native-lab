@@ -227,7 +227,7 @@ class ServerSchemaTests(unittest.TestCase):
 
         names = {tool.name for tool in mcp._tool_manager.list_tools()}
         self.assertEqual(
-            names, {"run", "head", "tail", "expect", "wait", "write", "kill", "processes"}
+            names, {"run", "head", "tail", "expect", "wait", "write", "kill", "processes", "diagnostics"}
         )
 
     def test_expect_schema_uses_unambiguous_from_position(self) -> None:

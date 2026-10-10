@@ -178,6 +178,27 @@ async def processes(ctx: Context[AppState]) -> dict[str, object]:
     return await _registry(ctx).processes()
 
 
+@mcp.tool()
+async def diagnostics() -> dict[str, object]:
+    """Report this MCP server's context without starting or stopping a session.
+
+    Namespace identifiers describe the MCP process itself, not the agent's shell.
+    Only selected environment fields are returned; no secrets or full environment.
+    """
+    namespaces = {}
+    for name in ("pid", "mnt", "user"):
+        try:
+            namespaces[name] = os.readlink(f"/proc/self/ns/{name}")
+        except OSError as error:
+            namespaces[name] = {"error": str(error)}
+    binary = _native_lab_binary()
+    return {"pid": os.getpid(), "ppid": os.getppid(), "uid": os.getuid(),
+            "euid": os.geteuid(), "gid": os.getgid(), "groups": os.getgroups(),
+            "cwd": os.getcwd(), "xdg_runtime_dir": os.environ.get("XDG_RUNTIME_DIR"),
+            "namespaces": namespaces, "native_lab_binary": binary,
+            "expected_daemon": str(Path(binary).with_name("native-labd"))}
+
+
 def main() -> None:
     mcp.run("stdio")
 

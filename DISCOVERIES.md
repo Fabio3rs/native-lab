@@ -449,3 +449,23 @@ A extensão futura NVIDIA terá provider próprio; não há CUDA/backend fictíc
 leitura de CDI do workspace ou reprodução de opções Docker que relaxem o isolamento.
 
 Comparação solicitada fora do NativeLab: `xvfb-run -a -s '-screen 0 640x480x24 -nolisten tcp'` no host produziu exatamente o mesmo resultado. `xdpyinfo` anunciou GLX e Present, sem DRI3; `glxinfo` retornou llvmpipe/Accelerated no; `glxgears` executou até timeout de 5 segundos (124); `vkcube` selecionou a Radeon e saiu 1 por ausência de DRI3. O servidor temporário foi encerrado pelo xvfb-run. Isso localiza a limitação nesse caminho Xvfb, independentemente do sandbox.
+
+
+## MCP e instalação duplicada: identidade do holder
+
+Após instalar a CLI em `~/.local/bin`, o MCP ainda selecionava por padrão o
+launcher do checkout. O ID de sessão depende do workspace/profile/policy, mas a
+validação de argv exige o caminho exato do daemon. O usuário confirmou que
+`NATIVE_LAB_BIN=/home/fabio/.local/bin/native-lab` no MCP resolveu a falha
+`session is operational but holder identity is invalid`. A correção alinha os
+clientes sem remover a checagem de identidade e sem encerrar a sessão válida.
+
+O shell desta investigação e o host tinham namespaces PID diferentes, mas isso
+não prova que o MCP tinha a mesma limitação. Não havia uma sessão ativa do projeto
+para inspecionar quando o diagnóstico foi iniciado. A nova ferramenta MCP
+`diagnostics` reporta seu próprio contexto e caminhos, sem revelar todo o ambiente.
+O holder-check distingue PID invisível/encerrado, permissão em proc, start-time,
+metadata e argv; `--diagnose` fornece JSON. Invisibilidade não é diagnosticada
+como morte comprovada. As regras de sinalização e reutilização continuam iguais.
+`stop` repetido agora informa sessão já encerrada; resíduos recuperados recebem
+uma mensagem diferente de encerramento de holder ativo.

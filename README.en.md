@@ -662,6 +662,7 @@ host shell:
 | `write` | writes UTF-8 to stdin and can send EOF |
 | `kill` | signals the SSH client group (`TERM`, or `KILL` with `force`) |
 | `processes` | lists handles owned by this MCP server instance |
+| `diagnostics` | server context and paths without starting sessions |
 
 Create the environment and install the repository lock file:
 
@@ -688,6 +689,27 @@ to another trusted launcher. Each process runs as:
 ```text
 native-lab run -- argv[0] argv[1] ...
 ```
+
+If the CLI is installed in `~/.local/bin`, align MCP with that installation:
+
+```toml
+[mcp_servers.native_lab.env]
+NATIVE_LAB_BIN = "/home/username/.local/bin/native-lab"
+```
+
+Use your actual absolute path and restart the MCP server after changing it.
+Without this override, MCP uses the launcher alongside the package in the checkout.
+CLI and MCP may find the same session ID, but different daemon paths are rejected
+by identity validation. Correcting the client configuration does not require
+stopping a valid session.
+
+The read-only `diagnostics` tool reports the MCP server's own PID, UID/groups,
+PID/mount/user namespaces, cwd, XDG_RUNTIME_DIR and selected launcher/daemon paths.
+This is distinct from the agent shell's context. Holder errors now include their
+cause; the helper's `holder-check --diagnose` accepts the same identity arguments
+and returns JSON without weakening validation. A missing `/proc` PID may mean
+an exited process or a process invisible from another namespace.
+
 
 `expect` performs literal matching, including across read boundaries.
 `from_position="now"` is the default and observes only new events;

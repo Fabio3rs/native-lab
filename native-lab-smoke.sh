@@ -252,7 +252,8 @@ status_rc=$?
 set -e
 [[ "$status_rc" -eq 1 ]] || fail 'stopped status should return 1'
 grep -q '^SSH socket:      stopped$' <<<"$stopped_status" || fail 'status did not report stopped'
-"$NATIVE_LAB" stop >/dev/null || fail 'second stop was not idempotent'
+second_stop=$("$NATIVE_LAB" stop) || fail 'second stop was not idempotent'
+grep -q 'session already stopped' <<<"$second_stop" || fail 'second stop claimed to terminate a holder'
 pass 'stop is complete and idempotent'
 
 printf 'All smoke tests passed.\n'
