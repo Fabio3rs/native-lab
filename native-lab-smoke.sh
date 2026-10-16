@@ -21,6 +21,7 @@ INTERNAL_PORT=$((20000 + $$ % 10000))
 HOST_PORT=$((INTERNAL_PORT + 1))
 HOST_SERVER_PID=
 INTERNAL_CLIENT_PID=
+STREAM_PID=
 
 fail() {
     printf 'FAIL: %s\n' "$*" >&2
@@ -37,9 +38,11 @@ cleanup() {
     set +e
     [[ -n "$INTERNAL_CLIENT_PID" ]] && kill "$INTERNAL_CLIENT_PID" 2>/dev/null
     [[ -n "$HOST_SERVER_PID" ]] && kill "$HOST_SERVER_PID" 2>/dev/null
+    [[ -n "$STREAM_PID" ]] && kill "$STREAM_PID" 2>/dev/null
     "$NATIVE_LAB" stop >/dev/null 2>&1
     wait "$INTERNAL_CLIENT_PID" 2>/dev/null
     wait "$HOST_SERVER_PID" 2>/dev/null
+    [[ -n "$STREAM_PID" ]] && wait "$STREAM_PID" 2>/dev/null
     rm -rf -- "$TEST_RUNTIME"
     rm -rf -- "$TEST_CONFIG"
     exit "$status"
@@ -185,20 +188,35 @@ raise SystemExit(1)
 pass 'Internet access is unavailable'
 
 stream_file="$TEST_RUNTIME/stream.out"
+# Require a round trip: the remote command cannot finish until the host has
+# observed its first output. Allow for policy checks and SSH startup on CI.
+mkfifo "$TEST_RUNTIME/stream.in"
+exec {stream_input}<>"$TEST_RUNTIME/stream.in"
 "$NATIVE_LAB" run python3 -u -c \
-    'import time; print("start", flush=True); time.sleep(1); print("end", flush=True)' \
-    >"$stream_file" &
-stream_pid=$!
+    'import select, sys
+print("start", flush=True)
+if not select.select([sys.stdin], [], [], 15)[0]:
+    raise SystemExit("stream acknowledgement timed out")
+if sys.stdin.readline() != "continue\n":
+    raise SystemExit("invalid stream acknowledgement")
+print("end", flush=True)' \
+    <"$TEST_RUNTIME/stream.in" >"$stream_file" &
+STREAM_PID=$!
 stream_seen=0
-for ((attempt = 0; attempt < 7; attempt++)); do
+for ((attempt = 0; attempt < 100; attempt++)); do
     if grep -q '^start$' "$stream_file" 2>/dev/null; then
         stream_seen=1
         break
     fi
+    kill -0 "$STREAM_PID" 2>/dev/null || break
     sleep 0.1
 done
-[[ "$stream_seen" -eq 1 ]] || fail 'first output was buffered'
-wait "$stream_pid" || fail 'streaming command failed'
+[[ "$stream_seen" -eq 1 ]] || fail 'first output not received within 10s (startup delay or buffering)'
+! grep -q '^end$' "$stream_file" || fail 'streaming command finished before acknowledgement'
+printf 'continue\n' >&"$stream_input"
+wait "$STREAM_PID" || fail 'streaming command failed'
+STREAM_PID=
+exec {stream_input}>&-
 grep -q '^end$' "$stream_file" || fail 'streaming command lost final output'
 pass 'stdout streams before process exit'
 
