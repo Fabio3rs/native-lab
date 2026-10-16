@@ -15,6 +15,8 @@ stage() {
 }
 trap 'status=$?; printf "native-labd: error phase=%s line=%s status=%s\n" "$PHASE" "$LINENO" "$status" >&2' ERR
 
+# Called indirectly by the shutdown trap through dump_bwrap.
+# shellcheck disable=SC2317
 dump_process() {
     local pid=$1 line
     printf 'native-labd: process pid=%s\n' "$pid" >&2
@@ -28,6 +30,8 @@ dump_process() {
     fi
 }
 
+# Called indirectly by the shutdown trap.
+# shellcheck disable=SC2317
 dump_bwrap() {
     local child children
     dump_process "$BWRAP_PID"
