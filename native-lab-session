@@ -1,5 +1,12 @@
 #!/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
+
+PHASE=initializing
+stage() {
+    PHASE=$1
+    printf 'native-lab-session: [%s +%ss] %s\n' "${EPOCHREALTIME}" "$SECONDS" "$PHASE" >&2
+}
+trap 'status=$?; printf "native-lab-session: error phase=%s line=%s status=%s\n" "$PHASE" "$LINENO" "$status" >&2' ERR
 
 umask 077
 
@@ -22,16 +29,20 @@ need() {
     command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
 }
 
+stage 'bootstrap entered; bubblewrap mount setup completed; checking dependencies'
 need socat
 need sshd
 need ssh-keygen
 need readlink
 
+stage 'checking control directory'
 [[ -d "$CONTROL_DIR" && ! -L "$CONTROL_DIR" ]] || die "invalid control directory: $CONTROL_DIR"
 chmod 700 "$CONTROL_DIR"
 
+stage 'validating GPU policy inside sandbox'
 python3 -I /run/native-lab-bootstrap/native-lab-policy.py validate-gpu \
     --policy /run/native-lab-bootstrap/resolved-policy.json
+stage 'acknowledging bootstrap; waiting for daemon release'
 printf '%s\n' "$$" >"$MOUNTS_READY"
 chmod 600 "$MOUNTS_READY"
 deadline=$((SECONDS + MOUNT_RELEASE_TIMEOUT_SECONDS))
@@ -42,6 +53,7 @@ done
     die 'daemon did not release mount setup before timeout'
 rm -f -- "$MOUNTS_READY" "$MOUNTS_RELEASE"
 
+stage 'daemon released bootstrap; preparing SSH'
 mkdir -p /run/sshd
 chmod 755 /run/sshd
 
@@ -54,6 +66,7 @@ CONFIG="$CONTROL_DIR/sshd_config"
 INETD_WRAPPER="$CONTROL_DIR/sshd-inetd.sh"
 USER_FILE="$CONTROL_DIR/user"
 
+stage 'preparing SSH keys'
 [[ -s "$HOST_KEY" ]] || ssh-keygen -q -t ed25519 -N '' -f "$HOST_KEY"
 [[ -s "$CLIENT_KEY" ]] || ssh-keygen -q -t ed25519 -N '' -f "$CLIENT_KEY"
 
@@ -69,6 +82,7 @@ chmod 644 "$HOST_KEY.pub" "$CLIENT_KEY.pub" "$USER_FILE"
 } >"$KNOWN_HOSTS"
 chmod 600 "$KNOWN_HOSTS"
 
+stage 'writing SSH configuration'
 cat >"$CONFIG" <<EOF
 HostKey $HOST_KEY
 PidFile none
@@ -132,6 +146,7 @@ printf '  mountns:   %s\n' "$(readlink /proc/self/ns/mnt)"
 
 # Do not add socat's "stderr" address option: sshd diagnostics must never be
 # copied into the SSH protocol byte stream.
+stage 'starting SSH socket listener'
 socat "UNIX-LISTEN:$SOCK,fork,mode=0600" "EXEC:$INETD_WRAPPER" &
 LISTENER_PID=$!
 wait "$LISTENER_PID"

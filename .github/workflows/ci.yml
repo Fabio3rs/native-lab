@@ -111,7 +111,7 @@ jobs:
             native-lab-gpu-smoke.sh
 
       - name: GPU policy tests (no physical GPU required)
-        run: python3 -m unittest -v tests.test_gpu
+        run: python3 -m unittest -v tests.test_gpu tests.test_startup_logging
 
       - name: Verify unavailable GPU is explicitly skipped
         run: |

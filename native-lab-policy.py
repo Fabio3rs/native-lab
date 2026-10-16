@@ -39,14 +39,7 @@ SYSTEM_READ_ONLY = (
     "/run/current-system/sw",
 )
 PROTECTED_METADATA = (".git", ".agents", ".codex")
-DEFAULT_DENY_GLOBS = (
-    "**/.env",
-    "**/.env.*",
-    "**/*.pem",
-    "**/*.key",
-    "**/*.p12",
-    "**/*.pfx",
-)
+DEFAULT_DENY_GLOBS: tuple[str, ...] = ()
 PRIVATE_MOUNT_ROOTS = ("/tmp", "/run", "/proc", "/dev")
 
 
@@ -180,6 +173,7 @@ def parse_native_config(
         "filesystem": {
             "extra_read_only": [],
             "extra_trusted_project_deny_globs": [],
+            "trusted_project_allow_paths": [],
         },
     }
     if path is None:
@@ -200,7 +194,7 @@ def parse_native_config(
         fail(f"unknown [codex] keys: {', '.join(unknown)}")
     filesystem = expect_table(raw.get("filesystem", {}), "[filesystem]")
     unknown = sorted(
-        set(filesystem) - {"extra_read_only", "extra_trusted_project_deny_globs"}
+        set(filesystem) - {"extra_read_only", "extra_trusted_project_deny_globs", "trusted_project_allow_paths"}
     )
     if unknown:
         fail(f"unknown [filesystem] keys: {', '.join(unknown)}")
@@ -218,6 +212,10 @@ def parse_native_config(
             ),
         },
         "filesystem": {
+            "trusted_project_allow_paths": expect_string_list(
+                filesystem.get("trusted_project_allow_paths", []),
+                "filesystem.trusted_project_allow_paths",
+            ),
             "extra_read_only": expect_string_list(
                 filesystem.get("extra_read_only", []),
                 "filesystem.extra_read_only",
@@ -480,6 +478,8 @@ def collect_read_only_roots(
 
 
 def run_rg(rg: str, root: str, globs: list[str]) -> list[str]:
+    if not globs:
+        return []
     command = [rg, "--files", "--hidden", "--no-ignore", "--null"]
     for pattern in globs:
         command.extend(("--glob", pattern))
@@ -510,10 +510,13 @@ def run_rg(rg: str, root: str, globs: list[str]) -> list[str]:
 def collapse_masks(masks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     unique = {mask["path"]: mask for mask in masks}
     result: list[dict[str, Any]] = []
+    directories: set[str] = set()
     for path in sorted(unique, key=lambda value: (value.count(os.sep), value)):
-        if any(mask["kind"] in {"directory", "missing-directory"} and is_within(path, mask["path"]) for mask in result):
+        if any(str(parent) in directories for parent in Path(path).parents):
             continue
         result.append(unique[path])
+        if unique[path]["kind"] in {"directory", "missing-directory"}:
+            directories.add(path)
     return result
 
 
@@ -564,6 +567,14 @@ def compile_policy(workspace: str, rg: str, runtime_root: str, read_only: bool =
         }
     )
 
+    allow_paths = sorted({
+        os.path.realpath(expand_tilde(path, home, "filesystem.trusted_project_allow_paths"))
+        for path in native["filesystem"]["trusted_project_allow_paths"]
+    })
+    for path in allow_paths:
+        if forbidden_home_root(path, home_canonical) or conflicts_private_mount(path):
+            fail(f"unsafe trusted-project exception: {path}")
+
     masks: list[dict[str, Any]] = []
     for name in PROTECTED_METADATA:
         path = os.path.join(workspace, name)
@@ -602,8 +613,14 @@ def compile_policy(workspace: str, rg: str, runtime_root: str, read_only: bool =
             except FileNotFoundError:
                 continue
             masks.append(mask_for_existing(path, "trusted-metadata"))
+        # Whole explicitly allowed trees need no deny scan. Metadata above is
+        # still masked, including when the exception names the project root.
+        if any(is_within(project, allowed) for allowed in allow_paths):
+            continue
         for path in run_rg(rg, project, deny_globs):
             if is_within(path, workspace):
+                continue
+            if any(is_within(path, allowed) for allowed in allow_paths):
                 continue
             match_count += 1
             if match_count > MAX_DENY_MATCHES:
@@ -632,6 +649,7 @@ def compile_policy(workspace: str, rg: str, runtime_root: str, read_only: bool =
             "codex_present": codex_config_path is not None,
             "import_trusted_projects": native["codex"]["import_trusted_projects"],
             "extra_read_only": sorted(native["filesystem"]["extra_read_only"]),
+            "trusted_project_allow_paths": allow_paths,
             "extra_trusted_project_deny_globs": sorted(
                 native["filesystem"]["extra_trusted_project_deny_globs"]
             ),
@@ -876,14 +894,24 @@ def emit_bwrap(manifest: dict[str, Any], mask_source: str) -> tuple[bytes, bytes
     append_arg(args, "--chmod", "0700", f"/run/user/{uid}")
 
     roots = manifest["roots"]
-    for entry in roots["system_read_only"]:
+    readonly = (
+        roots["system_read_only"] + roots["user_read_only"]
+        + [{"source": project, "destination": project} for project in roots["trusted_projects"]]
+        + resources["readonly_mounts"]
+    )
+    mounted: set[str] = set()
+    for entry in readonly:
+        source, destination = entry["source"], entry["destination"]
+        # Only prune identity mappings. Masks below replace the contents and
+        # must remain even when their parent is already read-only.
+        if source == destination:
+            if destination in mounted or any(str(parent) in mounted for parent in Path(destination).parents):
+                continue
+            mounted.add(destination)
+        else:
+            # A remapped subtree can invalidate earlier identity coverage.
+            mounted.clear()
         append_arg(args, "--ro-bind", entry["source"], entry["destination"])
-    for entry in roots["user_read_only"]:
-        append_arg(args, "--ro-bind", entry["source"], entry["destination"])
-    for project in roots["trusted_projects"]:
-        append_arg(args, "--ro-bind", project, project)
-    for mount in resources["readonly_mounts"]:
-        append_arg(args, "--ro-bind", mount["source"], mount["destination"])
     for link in resources["symlinks"]:
         append_arg(args, "--symlink", link["target"], link["path"])
     if resources["nodes"]:

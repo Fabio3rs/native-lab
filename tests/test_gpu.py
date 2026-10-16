@@ -286,6 +286,69 @@ class ConfigAndPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(policy.PolicyError, "only be inspected"):
             policy.emit_bwrap(m, "/mask")
 
+    def test_redundant_roots_pruned_but_masks_and_workspace_preserved(self):
+        m = self.compile()
+        m["roots"]["user_read_only"] = [
+            dict(source="/deps", destination="/deps"),
+            dict(source="/deps", destination="/deps"),
+        ]
+        m["roots"]["trusted_projects"] = ["/deps/nested", "/deps-other"]
+        m["masks"] = [dict(path="/deps/nested/secret.key", kind="file"),
+                      dict(path="/deps/nested/.git", kind="directory")]
+        encoded, _ = policy.emit_bwrap(m, "/mask")
+        self.assertEqual(encoded.count(b"--ro-bind\0/deps\0/deps\0"), 1)
+        self.assertNotIn(b"--ro-bind\0/deps/nested\0", encoded)
+        self.assertIn(b"--ro-bind\0/deps-other\0/deps-other\0", encoded)
+        self.assertIn(b"--ro-bind\0/mask\0/deps/nested/secret.key\0", encoded)
+        self.assertIn(b"--tmpfs\0/deps/nested/.git\0--remount-ro\0", encoded)
+        self.assertIn(("--bind\0" + str(self.workspace) + "\0").encode(), encoded)
+
+    def test_collapse_masks_keeps_siblings_and_file_descendants(self):
+        masks = [dict(path=path, kind=kind) for path, kind in [
+            ("/deps/.git/config", "file"), ("/deps/.git", "directory"),
+            ("/deps/.git-other/key", "file"), ("/deps/file", "file"),
+            ("/deps/file/child", "file"), ("/deps/missing", "missing-directory"),
+            ("/deps/missing/child", "file"), ("/deps/file", "file"),
+        ]]
+        self.assertEqual({m["path"] for m in policy.collapse_masks(masks)},
+                         {"/deps/.git", "/deps/.git-other/key", "/deps/file",
+                          "/deps/file/child", "/deps/missing"})
+
+    def test_explicit_exceptions_preserve_other_secrets_and_metadata(self):
+        trusted = self.home / "trusted"
+        (trusted / "fixtures").mkdir(parents=True)
+        (trusted / ".git").mkdir()
+        for name in ("fixtures/test.key", "public.pem", "private.key", "public.pem.key"):
+            (trusted / name).touch()
+        config = ('\n[filesystem]\ntrusted_project_allow_paths = '
+                  + json.dumps([str(trusted / "fixtures"), str(trusted / "public.pem")])
+                  + '\nextra_trusted_project_deny_globs = ["**/*.key", "**/*.pem"]\n')
+        with patch.object(policy, "collect_trusted_projects", return_value=[str(trusted)]):
+            original = self.compile()
+            self.assertNotIn(str(trusted / "private.key"), {m["path"] for m in original["masks"]})
+            resolved = self.compile(config)
+            paths = {m["path"] for m in resolved["masks"]}
+            self.assertNotIn(str(trusted / "fixtures/test.key"), paths)
+            self.assertNotIn(str(trusted / "public.pem"), paths)
+            self.assertIn(str(trusted / "private.key"), paths)
+            self.assertIn(str(trusted / "public.pem.key"), paths)
+            self.assertIn(str(trusted / ".git"), paths)
+            self.assertNotEqual(original["policy_digest"], resolved["policy_digest"])
+            whole = self.compile('\n[filesystem]\ntrusted_project_allow_paths = '
+                                 + json.dumps([str(trusted)]) + '\n')
+            self.assertIn(str(trusted / ".git"), {m["path"] for m in whole["masks"]})
+
+    def test_invalid_exception_paths(self):
+        for path in ("relative/path", "/", str(self.home), "/tmp"):
+            with self.subTest(path=path), self.assertRaises(policy.PolicyError):
+                self.compile('\n[filesystem]\ntrusted_project_allow_paths = '
+                             + json.dumps([path]) + '\n')
+
+    def test_no_default_deny_scan(self):
+        self.assertEqual(policy.DEFAULT_DENY_GLOBS, ())
+        with patch.object(policy.subprocess, "run", side_effect=AssertionError("unexpected scan")):
+            self.assertEqual(policy.run_rg("rg", "/project", []), [])
+
     def test_invalid_manifest_rehashed_still_rejected(self):
         m = self.compile(self.gpu_table())
         m["gpu"]["nodes"][0]["path"] = "/dev/mem"

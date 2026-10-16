@@ -10,10 +10,12 @@ export PATH
 
 readonly PROFILE="default"
 readonly POLICY_VERSION="3"
-readonly STARTUP_TIMEOUT_SECONDS="5"
+# Leave time for the daemon's mount timeout and diagnostic cleanup.
+readonly STARTUP_TIMEOUT_SECONDS="15"
 readonly STOP_GRACE_SECONDS="2"
 
 POLICY_TMP=
+VERBOSE=0
 
 cleanup_client() {
     if [[ -n "$POLICY_TMP" ]]; then
@@ -30,7 +32,7 @@ die() {
 usage() {
     cat >&2 <<'EOF'
 Usage:
-  native-lab run [--] COMMAND [ARGS...]
+  native-lab run [--verbose] [--] COMMAND [ARGS...]
   native-lab status
   native-lab stop
   native-lab stop --all
@@ -403,10 +405,10 @@ ensure_session() {
         fi
         cleanup_stale_state
         release_lock
-        printf 'native-lab: session failed to become ready\n' >&2
+        printf 'native-lab: session failed to become ready within %ss; log: %s\n' "$STARTUP_TIMEOUT_SECONDS" "$LOG_FILE" >&2
         if [[ -s "$LOG_FILE" ]]; then
             printf '%s\n' '--- daemon.log ---' >&2
-            sed -n '1,200p' "$LOG_FILE" >&2
+            cat -- "$LOG_FILE" >&2
         fi
         exit 1
     fi
@@ -427,6 +429,10 @@ encode_remote_command() {
 }
 
 run_command() {
+    if [[ "${1:-}" == --verbose ]]; then
+        VERBOSE=1
+        shift
+    fi
     (($# > 0)) || usage
     if [[ "$1" == "--" ]]; then
         shift
@@ -434,6 +440,10 @@ run_command() {
     fi
     ensure_session_dirs
     ensure_session
+    if (( VERBOSE )); then
+        printf 'native-lab: startup log: %s\n' "$LOG_FILE" >&2
+        cat -- "$LOG_FILE" >&2
+    fi
     show_other_sessions >&2
     release_workspace_lock
     encode_remote_command "$@"

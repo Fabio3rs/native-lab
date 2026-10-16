@@ -1,12 +1,39 @@
 #!/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
 
 umask 077
 
 readonly HOST_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 PATH=$HOST_PATH
 export PATH
-readonly MOUNT_SETUP_TIMEOUT_SECONDS=5
+readonly MOUNT_SETUP_TIMEOUT_SECONDS=10
+
+PHASE=initializing
+stage() {
+    PHASE=$1
+    printf 'native-labd: [%s +%ss] %s\n' "${EPOCHREALTIME}" "$SECONDS" "$PHASE" >&2
+}
+trap 'status=$?; printf "native-labd: error phase=%s line=%s status=%s\n" "$PHASE" "$LINENO" "$status" >&2' ERR
+
+dump_process() {
+    local pid=$1 line
+    printf 'native-labd: process pid=%s\n' "$pid" >&2
+    if [[ -r /proc/$pid/status ]]; then
+        while IFS= read -r line; do
+            case "$line" in Name:*|State:*|PPid:*) printf '  %s\n' "$line" >&2 ;; esac
+        done <"/proc/$pid/status"
+        printf '  wchan: %s\n' "$(cat "/proc/$pid/wchan" 2>/dev/null || true)" >&2
+    else
+        printf '  process no longer present\n' >&2
+    fi
+}
+
+dump_bwrap() {
+    local child children
+    dump_process "$BWRAP_PID"
+    children=$(cat "/proc/$BWRAP_PID/task/$BWRAP_PID/children" 2>/dev/null || true)
+    for child in $children; do dump_process "$child"; done
+}
 
 die() {
     printf 'native-labd: %s\n' "$*" >&2
@@ -88,6 +115,7 @@ SCRIPT_DIR=$(dirname -- "$(realpath -- "$0")")
 SESSION_SCRIPT="$SCRIPT_DIR/native-lab-session"
 [[ -x "$SESSION_SCRIPT" ]] || die "missing executable: $SESSION_SCRIPT"
 
+stage 'verifying policy'
 "$PYTHON_BIN" -I "$POLICY_HELPER" verify \
     --policy "$POLICY_FILE" \
     --workspace "$WORKSPACE" \
@@ -107,6 +135,7 @@ POLICY_MOUNT_LOCK="$RUNTIME_ROOT/policy-mount.lock"
 [[ -d "$CONTROL_DIR" && ! -L "$CONTROL_DIR" ]] ||
     die "invalid control directory: $CONTROL_DIR"
 
+stage 'reading policy summary'
 "$PYTHON_BIN" -I "$POLICY_HELPER" summary --policy "$POLICY_FILE" >"$SUMMARY_FILE"
 HOME_VALUE=$(awk -F= '$1 == "home" { print substr($0, index($0, "=") + 1); exit }' "$SUMMARY_FILE")
 [[ -n "$HOME_VALUE" && "$HOME_VALUE" == /* ]] || die 'policy has invalid sandbox home'
@@ -130,17 +159,30 @@ rm -f -- "$SUMMARY_FILE"
 
 : >"$MASK_SOURCE"
 chmod 000 "$MASK_SOURCE"
+stage 'generating bubblewrap mount plan'
 "$PYTHON_BIN" -I "$POLICY_HELPER" emit-bwrap \
     --policy "$POLICY_FILE" \
     --mask-source "$MASK_SOURCE" \
     --args-output "$BWRAP_ARGS_FILE" \
     --synthetic-output "$SYNTHETIC_FILE"
 rm -f -- "$SYNTHETIC_FILE"
+# These are planned operations, not evidence that a mount has completed.
+PLAN_FILE="$SESSION_DIR/bwrap-plan.txt"
+argument_count=0
+{
+    while IFS= read -r -d '' argument; do
+        printf '%q\n' "$argument"
+        argument_count=$((argument_count + 1))
+    done <"$BWRAP_ARGS_FILE"
+} >"$PLAN_FILE"
+printf 'native-labd: planned policy bwrap arguments=%s; full plan: %s\n' "$argument_count" "$PLAN_FILE" >&2
 exec {BWRAP_ARGS_FD}<"$BWRAP_ARGS_FILE"
 
 rm -f -- "$MOUNTS_READY" "$MOUNTS_RELEASE"
 exec {POLICY_LOCK_FD}>"$POLICY_MOUNT_LOCK"
+stage 'waiting for policy mount lock'
 "$FLOCK_BIN" -x "$POLICY_LOCK_FD"
+stage 'policy mount lock acquired'
 
 BWRAP_PID=
 SYNTHETICS_REGISTERED=0
@@ -169,7 +211,9 @@ unregister_synthetics() {
 shutdown() {
     local status=$?
     trap - EXIT INT TERM HUP
+    printf 'native-labd: shutdown phase=%s status=%s\n' "$PHASE" "$status" >&2
     if [[ -n "$BWRAP_PID" ]]; then
+        dump_bwrap
         kill -TERM "$BWRAP_PID" 2>/dev/null || true
         wait "$BWRAP_PID" 2>/dev/null || true
     fi
@@ -191,6 +235,7 @@ trap shutdown EXIT INT TERM HUP
 # session lifetime; unregister_synthetics removes the empty placeholder only
 # after the last session using it exits.
 SYNTHETICS_REGISTERED=1
+stage 'registering synthetic mountpoints'
 "$PYTHON_BIN" -I "$POLICY_HELPER" register-synthetics \
     --policy "$POLICY_FILE" \
     --runtime-root "$RUNTIME_ROOT" \
@@ -202,7 +247,10 @@ INTERNAL_SESSION_SCRIPT=/run/native-lab-bootstrap/native-lab-session
 USER_VALUE=$(id -un)
 # Recheck immediately before bubblewrap. The bootstrap checks the mounted
 # identities again before announcing readiness, closing the path-bind gap.
+stage 'validating GPU policy on host before launch'
 "$PYTHON_BIN" -I "$POLICY_HELPER" validate-gpu --policy "$POLICY_FILE"
+printf 'native-labd: bootstrap source=%q destination=/run/native-lab-bootstrap; control source=%q destination=/run/native-lab-control; proc=/proc; root remount=read-only; cwd=%q\n' "$SCRIPT_DIR" "$CONTROL_DIR" "$WORKSPACE" >&2
+stage 'launching bubblewrap; waiting for bootstrap acknowledgement'
 (
     exec {POLICY_LOCK_FD}>&-
     exec "$BWRAP_BIN" \
@@ -241,21 +289,30 @@ USER_VALUE=$(id -un)
         -- "$INTERNAL_SESSION_SCRIPT"
 ) &
 BWRAP_PID=$!
+printf 'native-labd: bubblewrap pid=%s acknowledgement=%q timeout=%ss\n' "$BWRAP_PID" "$MOUNTS_READY" "$MOUNT_SETUP_TIMEOUT_SECONDS" >&2
 exec {BWRAP_ARGS_FD}>&-
 rm -f -- "$BWRAP_ARGS_FILE"
 
 deadline=$((SECONDS + MOUNT_SETUP_TIMEOUT_SECONDS))
 while [[ ! -e "$MOUNTS_READY" ]] && (( SECONDS < deadline )); do
+    if ! kill -0 "$BWRAP_PID" 2>/dev/null; then
+        status=0
+        wait "$BWRAP_PID" || status=$?
+        BWRAP_PID=
+        die "bubblewrap exited before bootstrap acknowledgement (status=$status); see preceding diagnostics"
+    fi
     sleep 0.05
 done
 [[ -f "$MOUNTS_READY" && ! -L "$MOUNTS_READY" ]] ||
-    die 'sandbox did not complete mount setup before timeout'
+    die "bootstrap acknowledgement missing after ${MOUNT_SETUP_TIMEOUT_SECONDS}s; mount setup or bootstrap checks may be incomplete (see last stage and process state)"
+stage 'bootstrap acknowledged; revalidating GPU policy on host'
 "$PYTHON_BIN" -I "$POLICY_HELPER" validate-gpu --policy "$POLICY_FILE"
 : >"$MOUNTS_RELEASE"
 chmod 600 "$MOUNTS_RELEASE"
 "$FLOCK_BIN" -u "$POLICY_LOCK_FD"
 exec {POLICY_LOCK_FD}>&-
 POLICY_LOCK_HELD=0
+stage 'bootstrap released; waiting for sandbox process'
 
 set +e
 wait "$BWRAP_PID"

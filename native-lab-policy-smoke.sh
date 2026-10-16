@@ -164,9 +164,11 @@ in_current run sh -c '
 
     grep -q trusted "$trusted/source.txt"
     ! sh -c "printf write >>\"$trusted/source.txt\"" 2>/dev/null
-    for denied in .env .env.local cert.pem private.key nested/archive.p12 nested/custom.secret; do
-        test ! -r "$trusted/$denied"
+    for allowed in .env .env.local cert.pem private.key nested/archive.p12; do
+        grep -q secret "$trusted/$allowed"
+        ! sh -c "printf write >>\"$trusted/$allowed\"" 2>/dev/null
     done
+    test ! -r "$trusted/nested/custom.secret"
     for denied in .git .agents .codex; do
         test ! -r "$trusted/$denied"
     done

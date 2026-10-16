@@ -265,15 +265,25 @@ Each imported project is RO. The following paths are denied:
 .git
 .agents
 .codex
-**/.env
-**/.env.*
-**/*.pem
-**/*.key
-**/*.p12
-**/*.pfx
 ```
 
-Matches are expanded on the host before `bwrap` with `rg --files --hidden
+There are no default extension-based blocks: certificates, test keys and `.env`
+in trusted projects remain readable, read-only. The user’s `.ssh` and `.gnupg`
+are excluded from the isolated HOME by default. With no configured globs,
+there is no recursive sensitive-file scan.
+
+`filesystem.trusted_project_allow_paths` accepts absolute or `~/` paths to
+files and directories exempt from configured deny globs. Directories include
+their descendants; exceptions neither grant write access nor remove project
+root metadata protection. Example:
+
+```toml
+[filesystem]
+extra_trusted_project_deny_globs = ["**/*.key"]
+trusted_project_allow_paths = ["/path/project/tests/certs"]
+```
+
+Configured glob matches are expanded on the host before `bwrap` with `rg --files --hidden
 --no-ignore`. A match that is a symlink or another unexpected object aborts the
 session. There is no silent fallback that broadens access.
 
@@ -301,6 +311,7 @@ config_path = "~/.codex/config.toml"
 [filesystem]
 extra_read_only = []
 extra_trusted_project_deny_globs = []
+trusted_project_allow_paths = []
 ```
 
 `extra_read_only` adds paths to the defaults; it does not replace them. There
@@ -830,7 +841,21 @@ and tracked private keys.
 native-lab status
 ```
 
-Startup failures display the first lines of `daemon.log`. Common errors:
+Startup failures display the path and contents of `daemon.log`. Use
+`native-lab run --verbose bash` to display this log on successful startup too
+(or when reusing an existing session). It records stages with timestamps and
+elapsed time, bubblewrap argument count and the full plan path (`bwrap-plan.txt`,
+one shell-escaped argument per line), bootstrap entry, validation,
+and SSH preparation. Failures report the exit status or, on timeout, process
+state and `wchan` for bubblewrap and its direct children. The mount plan does
+not identify the operation currently executing; bootstrap entry confirms that
+bubblewrap completed the mounts. Read-only mounts already covered by a mounted
+directory are omitted. Sensitive-file masks remain necessary because read-only
+access still allows reading contents. The daemon waits 10 seconds for bootstrap
+acknowledgement; the client allows 15 seconds for full startup and daemon
+diagnostics.
+
+Common errors:
 
 - `XDG_RUNTIME_DIR is not set`: the user runtime is unavailable;
 - `missing dependency`: a host-side tool is missing;

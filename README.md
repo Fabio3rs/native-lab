@@ -265,15 +265,25 @@ Cada projeto importado é RO. Os seguintes paths são negados:
 .git
 .agents
 .codex
-**/.env
-**/.env.*
-**/*.pem
-**/*.key
-**/*.p12
-**/*.pfx
 ```
 
-Os matches são expandidos no host antes do `bwrap` com `rg --files --hidden
+Não há bloqueio padrão por extensão: certificados, chaves de teste e `.env`
+dos projetos confiáveis permanecem legíveis, somente leitura. A `.ssh` e a
+`.gnupg` do usuário ficam fora do HOME isolado por padrão. Sem globs
+configurados, não há varredura recursiva de arquivos sensíveis.
+
+`filesystem.trusted_project_allow_paths` aceita caminhos absolutos ou com `~/`
+para arquivos e diretórios excluídos dos globs de bloqueio configurados.
+Diretórios incluem seus descendentes; as exceções não concedem escrita nem
+removem a proteção dos metadados na raiz dos projetos. Exemplo:
+
+```toml
+[filesystem]
+extra_trusted_project_deny_globs = ["**/*.key"]
+trusted_project_allow_paths = ["/caminho/projeto/tests/certs"]
+```
+
+Os matches dos globs configurados são expandidos no host antes do `bwrap` com `rg --files --hidden
 --no-ignore`. Um match que seja symlink ou outro objeto inesperado aborta a
 sessão. Não existe fallback silencioso que amplie acesso.
 
@@ -301,6 +311,7 @@ config_path = "~/.codex/config.toml"
 [filesystem]
 extra_read_only = []
 extra_trusted_project_deny_globs = []
+trusted_project_allow_paths = []
 ```
 
 `extra_read_only` adiciona paths aos defaults; não os substitui. Não existe
@@ -828,7 +839,21 @@ rejeita runtime antigo e private keys rastreadas.
 native-lab status
 ```
 
-Falhas de startup exibem as primeiras linhas de `daemon.log`. Erros comuns:
+Falhas de startup exibem o caminho e o conteúdo de `daemon.log`. Use
+`native-lab run --verbose bash` para exibir esse log também quando a sessão
+iniciar com sucesso (ou reutilizar uma sessão existente). O log registra etapas
+com horário e tempo decorrido, contagem dos argumentos de montagem do bubblewrap
+e caminho do plano completo (`bwrap-plan.txt`, um argumento escapado por linha),
+entrada no bootstrap, validações e preparação do SSH. Em falhas, registra o
+código de saída ou, no timeout, o estado e `wchan` do processo e filhos diretos.
+O plano de montagem não identifica qual operação está em execução; a mensagem
+de entrada no bootstrap confirma que o bubblewrap concluiu as montagens.
+Mounts somente leitura já cobertos por um diretório montado são omitidos.
+As máscaras de arquivos sensíveis continuam necessárias: somente leitura ainda
+permite ler o conteúdo. O daemon espera 10 segundos pelo reconhecimento do bootstrap; o cliente permite
+15 segundos para a inicialização completa e os diagnósticos do daemon.
+
+Erros comuns:
 
 - `XDG_RUNTIME_DIR is not set`: runtime do usuário indisponível;
 - `missing dependency`: falta uma ferramenta host-side;
